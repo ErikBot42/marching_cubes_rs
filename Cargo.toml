@@ -1,0 +1,18 @@
+[package]
+name = "marching_cubes_rs"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bytemuck = { version = "1.15.0", features = ["derive"] }
+env_logger = "0.11.3"
+log = "0.4.21"
+pollster = "0.3.0"
+wgpu = "0.19.3"
+winit = "0.29.15"
+
+
+[profile.dev.package."*"]
+opt-level = 3
