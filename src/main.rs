@@ -4,6 +4,7 @@ use std::{
     hash::Hash,
     marker::Copy,
     mem::{transmute, MaybeUninit},
+    time::Instant,
 };
 
 use pollster::FutureExt;
@@ -38,8 +39,22 @@ const VERTS: [[i32; 3]; 8] = [
     [1, 1, 1],
 ];
 
+const EDGES: [[usize; 2]; 12] = [
+    [0, 1],
+    [2, 3],
+    [4, 5],
+    [6, 7],
+    [0, 2],
+    [1, 3],
+    [4, 6],
+    [5, 7],
+    [0, 4],
+    [1, 5],
+    [2, 6],
+    [3, 7],
+];
 
-fn gen_cases() {
+fn gen_cases() -> [Vec<[usize; 3]>; 256] {
     //
     //     .4------5
     //   .' |    .'|
@@ -70,13 +85,6 @@ fn gen_cases() {
         v
     }
 
-    //      z
-    //      |
-    //      |
-    //      |
-    //     .0------x
-    //   .'
-    //  y
     let transforms = [
         [[-1, 0, 0], [0, 1, 0], [0, 0, 1]],
         [[1, 0, 0], [0, -1, 0], [0, 0, 1]],
@@ -86,21 +94,6 @@ fn gen_cases() {
         [[0, -1, 0], [1, 0, 0], [0, 0, 1]],
     ]
     .map(|m| make_transform(&VERTS, m));
-
-    let edges: [[usize; 2]; 12] = [
-        [0, 1],
-        [2, 3],
-        [4, 5],
-        [6, 7],
-        [0, 2],
-        [1, 3],
-        [4, 6],
-        [5, 7],
-        [0, 4],
-        [1, 5],
-        [2, 6],
-        [3, 7],
-    ];
 
     let s01: usize = 0;
     let s23: usize = 1;
@@ -135,32 +128,27 @@ fn gen_cases() {
 
     // created manually from the cases presented on wikipedia
     #[rustfmt::skip]
-        let cases = vec![
-            (0, vec![]),
-            (t2, vec![[s02, s23, s26]]),
-            (t2|t3, vec![[s02, s13, s26], [s26, s37, s13]]),
-            (t2|t7, vec![[s02, s23, s26], [s67, s57, s37]]),
-            (t0|t1|t3, vec![[s02, s23, s37], [s02, s04, s37], [s04, s15, s37]]),
-            // ----
-            (t0|t1|t2|t3, vec![[s04, s15, s26], [s15, s37, s26]]),
-            (t6|t0|t1|t3, vec![[s46, s67, s26], [s04, s15, s37], [s37, s04, s02], [s23, s37, s02]]),
-            (t4|t7|t2|t1, vec![[s02, s23, s26], [s46, s45, s04], [s67, s57, s37], [s01, s13, s15]]),
-            (t4|t1|t0|t2, vec![[s45, s46, s26], [s26, s45, s23], [s45, s15, s23], [s15, s13, s23]]),
-            (t4|t0|t1|t3, vec![[s45, s15, s46], [s46, s15, s23], [s46, s23, s02], [s23, s15, s37]]),
-            // ----
-            (t2|t5, vec![[s45, s15, s57], [s02, s23, s26]]),
-            (t2|t3|t5, vec![[s45, s15, s57], [s02, s13, s26], [s13, s26, s37]]),
-            (t6|t5|t3, vec![[s46, s67, s26], [s15, s57, s45], [s37, s13, s23]]),
-            (t2|t6|t1|t5, vec![[s46, s02, s23], [s46, s67, s23], [s45, s57, s13], [s01, s13, s45]]),
-            (t1|t5|t2|t0, vec![[s45, s57, s04], [s26, s23, s04], [s04, s57, s23], [s13, s23, s57]]),
-        ];
+    let mut front: VecDeque<_> = [
+        (0, vec![]),
+        (t2, vec![[s02, s23, s26]]),
+        (t2|t3, vec![[s02, s13, s26], [s26, s37, s13]]),
+        (t2|t7, vec![[s02, s23, s26], [s67, s57, s37]]),
+        (t0|t1|t3, vec![[s02, s23, s37], [s02, s04, s37], [s04, s15, s37]]),
+        // ----
+        (t0|t1|t2|t3, vec![[s04, s15, s26], [s15, s37, s26]]),
+        (t6|t0|t1|t3, vec![[s46, s67, s26], [s04, s15, s37], [s37, s04, s02], [s23, s37, s02]]),
+        (t4|t7|t2|t1, vec![[s02, s23, s26], [s46, s45, s04], [s67, s57, s37], [s01, s13, s15]]),
+        (t4|t1|t0|t2, vec![[s45, s46, s26], [s26, s45, s23], [s45, s15, s23], [s15, s13, s23]]),
+        (t4|t0|t1|t3, vec![[s45, s15, s46], [s46, s15, s23], [s46, s23, s02], [s23, s15, s37]]),
+        // ----
+        (t2|t5, vec![[s45, s15, s57], [s02, s23, s26]]),
+        (t2|t3|t5, vec![[s45, s15, s57], [s02, s13, s26], [s13, s26, s37]]),
+        (t6|t5|t3, vec![[s46, s67, s26], [s15, s57, s45], [s37, s13, s23]]),
+        (t2|t6|t1|t5, vec![[s46, s02, s23], [s46, s67, s23], [s45, s57, s13], [s01, s13, s45]]),
+        (t1|t5|t2|t0, vec![[s45, s57, s04], [s26, s23, s04], [s04, s57, s23], [s13, s23, s57]]),
+    ].into_iter().collect();
 
     let mut found: [_; 256] = std::array::from_fn(|_| None);
-    let mut front = VecDeque::new();
-
-    for (i, c) in cases {
-        front.push_back((i, c));
-    }
 
     while let Some((i, c)) = front.pop_front() {
         for transform in transforms {
@@ -180,9 +168,9 @@ fn gen_cases() {
                     .map(|tri| {
                         tri.map(|edge_vertex| {
                             let mut transformed =
-                                edges[edge_vertex].map(|vertex| transform[vertex]);
+                                EDGES[edge_vertex].map(|vertex| transform[vertex]);
                             transformed.sort();
-                            edges.index(transformed)
+                            EDGES.index(transformed)
                         })
                     })
                     .collect();
@@ -191,13 +179,18 @@ fn gen_cases() {
         }
         found[i] = Some(c);
     }
-    dbg!(&found);
-    let f: Vec<_> = found
-        .iter()
-        .enumerate()
-        .filter_map(|(i, f)| f.is_none().then_some(i))
-        .collect();
-    dbg!(&f);
+    // let found: [Vec<_>; 256] = found.map(|f| {
+    //     f.unwrap()
+    //         .into_iter()
+    //         .map(|v| {
+    //             v.map(|i| {
+    //                 let [[ax, ay, az], [bx, by, bz]] = EDGES[i].map(|s| VERTS[s].map(|v| v as f32));
+    //                 [ax + bx, ay + by, az + bz].map(|e| e * 0.5)
+    //             })
+    //         })
+    //         .collect()
+    // });
+    found.map(|f| f.unwrap())
 }
 
 trait SearchExt<T: Copy + Eq> {
@@ -226,325 +219,189 @@ fn cmap<U: Copy, V: Copy, const N: usize>(a: [U; N], f: fn(U) -> V, v_default: V
     output
 }
 
-fn cube_march_cpu() {
-    gen_cases();
 
-    panic!();
-    let size = 100;
-    let cases = [
-        vec![],
-        vec![[8, 0, 3]],
-        vec![[1, 0, 9]],
-        vec![[8, 1, 3], [8, 9, 1]],
-        vec![[10, 2, 1]],
-        vec![[8, 0, 3], [1, 10, 2]],
-        vec![[9, 2, 0], [9, 10, 2]],
-        vec![[3, 8, 2], [2, 8, 10], [10, 8, 9]],
-        vec![[3, 2, 11]],
-        vec![[0, 2, 8], [2, 11, 8]],
-        vec![[1, 0, 9], [2, 11, 3]],
-        vec![[2, 9, 1], [11, 9, 2], [8, 9, 11]],
-        vec![[3, 10, 11], [3, 1, 10]],
-        vec![[1, 10, 0], [0, 10, 8], [8, 10, 11]],
-        vec![[0, 11, 3], [9, 11, 0], [10, 11, 9]],
-        vec![[8, 9, 11], [11, 9, 10]],
-        vec![[7, 4, 8]],
-        vec![[3, 7, 0], [7, 4, 0]],
-        vec![[7, 4, 8], [9, 1, 0]],
-        vec![[9, 1, 4], [4, 1, 7], [7, 1, 3]],
-        vec![[7, 4, 8], [2, 1, 10]],
-        vec![[4, 3, 7], [4, 0, 3], [2, 1, 10]],
-        vec![[2, 0, 10], [0, 9, 10], [7, 4, 8]],
-        vec![[9, 10, 4], [4, 10, 3], [3, 10, 2], [4, 3, 7]],
-        vec![[4, 8, 7], [3, 2, 11]],
-        vec![[7, 4, 11], [11, 4, 2], [2, 4, 0]],
-        vec![[1, 0, 9], [2, 11, 3], [8, 7, 4]],
-        vec![[2, 11, 1], [1, 11, 9], [9, 11, 7], [9, 7, 4]],
-        vec![[10, 11, 1], [11, 3, 1], [4, 8, 7]],
-        vec![[4, 0, 7], [7, 0, 10], [0, 1, 10], [7, 10, 11]],
-        vec![[7, 4, 8], [0, 11, 3], [9, 11, 0], [10, 11, 9]],
-        vec![[4, 11, 7], [9, 11, 4], [10, 11, 9]],
-        vec![[9, 4, 5]],
-        vec![[9, 4, 5], [0, 3, 8]],
-        vec![[0, 5, 1], [0, 4, 5]],
-        vec![[4, 3, 8], [5, 3, 4], [1, 3, 5]],
-        vec![[5, 9, 4], [10, 2, 1]],
-        vec![[8, 0, 3], [1, 10, 2], [4, 5, 9]],
-        vec![[10, 4, 5], [2, 4, 10], [0, 4, 2]],
-        vec![[3, 10, 2], [8, 10, 3], [5, 10, 8], [4, 5, 8]],
-        vec![[9, 4, 5], [11, 3, 2]],
-        vec![[11, 0, 2], [11, 8, 0], [9, 4, 5]],
-        vec![[5, 1, 4], [1, 0, 4], [11, 3, 2]],
-        vec![[5, 1, 4], [4, 1, 11], [1, 2, 11], [4, 11, 8]],
-        vec![[3, 10, 11], [3, 1, 10], [5, 9, 4]],
-        vec![[9, 4, 5], [1, 10, 0], [0, 10, 8], [8, 10, 11]],
-        vec![[5, 0, 4], [11, 0, 5], [11, 3, 0], [10, 11, 5]],
-        vec![[5, 10, 4], [4, 10, 8], [8, 10, 11]],
-        vec![[9, 7, 5], [9, 8, 7]],
-        vec![[0, 5, 9], [3, 5, 0], [7, 5, 3]],
-        vec![[8, 7, 0], [0, 7, 1], [1, 7, 5]],
-        vec![[7, 5, 3], [3, 5, 1]],
-        vec![[7, 5, 8], [5, 9, 8], [2, 1, 10]],
-        vec![[10, 2, 1], [0, 5, 9], [3, 5, 0], [7, 5, 3]],
-        vec![[8, 2, 0], [5, 2, 8], [10, 2, 5], [7, 5, 8]],
-        vec![[2, 3, 10], [10, 3, 5], [5, 3, 7]],
-        vec![[9, 7, 5], [9, 8, 7], [11, 3, 2]],
-        vec![[0, 2, 9], [9, 2, 7], [7, 2, 11], [9, 7, 5]],
-        vec![[3, 2, 11], [8, 7, 0], [0, 7, 1], [1, 7, 5]],
-        vec![[11, 1, 2], [7, 1, 11], [5, 1, 7]],
-        vec![[3, 1, 11], [11, 1, 10], [8, 7, 9], [9, 7, 5]],
-        vec![[11, 7, 0], [7, 5, 0], [5, 9, 0], [10, 11, 0], [1, 10, 0]],
-        vec![[0, 5, 10], [0, 7, 5], [0, 8, 7], [0, 10, 11], [0, 11, 3]],
-        vec![[10, 11, 5], [11, 7, 5]],
-        vec![[5, 6, 10]],
-        vec![[8, 0, 3], [10, 5, 6]],
-        vec![[0, 9, 1], [5, 6, 10]],
-        vec![[8, 1, 3], [8, 9, 1], [10, 5, 6]],
-        vec![[1, 6, 2], [1, 5, 6]],
-        vec![[6, 2, 5], [2, 1, 5], [8, 0, 3]],
-        vec![[5, 6, 9], [9, 6, 0], [0, 6, 2]],
-        vec![[5, 8, 9], [2, 8, 5], [3, 8, 2], [6, 2, 5]],
-        vec![[3, 2, 11], [10, 5, 6]],
-        vec![[0, 2, 8], [2, 11, 8], [5, 6, 10]],
-        vec![[3, 2, 11], [0, 9, 1], [10, 5, 6]],
-        vec![[5, 6, 10], [2, 9, 1], [11, 9, 2], [8, 9, 11]],
-        vec![[11, 3, 6], [6, 3, 5], [5, 3, 1]],
-        vec![[11, 8, 6], [6, 8, 1], [1, 8, 0], [6, 1, 5]],
-        vec![[5, 0, 9], [6, 0, 5], [3, 0, 6], [11, 3, 6]],
-        vec![[6, 9, 5], [11, 9, 6], [8, 9, 11]],
-        vec![[7, 4, 8], [6, 10, 5]],
-        vec![[3, 7, 0], [7, 4, 0], [10, 5, 6]],
-        vec![[7, 4, 8], [6, 10, 5], [9, 1, 0]],
-        vec![[5, 6, 10], [9, 1, 4], [4, 1, 7], [7, 1, 3]],
-        vec![[1, 6, 2], [1, 5, 6], [7, 4, 8]],
-        vec![[6, 1, 5], [2, 1, 6], [0, 7, 4], [3, 7, 0]],
-        vec![[4, 8, 7], [5, 6, 9], [9, 6, 0], [0, 6, 2]],
-        vec![[2, 3, 9], [3, 7, 9], [7, 4, 9], [6, 2, 9], [5, 6, 9]],
-        vec![[2, 11, 3], [7, 4, 8], [10, 5, 6]],
-        vec![[6, 10, 5], [7, 4, 11], [11, 4, 2], [2, 4, 0]],
-        vec![[1, 0, 9], [8, 7, 4], [3, 2, 11], [5, 6, 10]],
-        vec![[1, 2, 9], [9, 2, 11], [9, 11, 4], [4, 11, 7], [5, 6, 10]],
-        vec![[7, 4, 8], [11, 3, 6], [6, 3, 5], [5, 3, 1]],
-        vec![[11, 0, 1], [11, 4, 0], [11, 7, 4], [11, 1, 5], [11, 5, 6]],
-        vec![[6, 9, 5], [0, 9, 6], [11, 0, 6], [3, 0, 11], [4, 8, 7]],
-        vec![[5, 6, 9], [9, 6, 11], [9, 11, 7], [9, 7, 4]],
-        vec![[4, 10, 9], [4, 6, 10]],
-        vec![[10, 4, 6], [10, 9, 4], [8, 0, 3]],
-        vec![[1, 0, 10], [10, 0, 6], [6, 0, 4]],
-        vec![[8, 1, 3], [6, 1, 8], [6, 10, 1], [4, 6, 8]],
-        vec![[9, 2, 1], [4, 2, 9], [6, 2, 4]],
-        vec![[3, 8, 0], [9, 2, 1], [4, 2, 9], [6, 2, 4]],
-        vec![[0, 4, 2], [2, 4, 6]],
-        vec![[8, 2, 3], [4, 2, 8], [6, 2, 4]],
-        vec![[4, 10, 9], [4, 6, 10], [2, 11, 3]],
-        vec![[11, 8, 2], [2, 8, 0], [6, 10, 4], [4, 10, 9]],
-        vec![[2, 11, 3], [1, 0, 10], [10, 0, 6], [6, 0, 4]],
-        vec![[8, 4, 1], [4, 6, 1], [6, 10, 1], [11, 8, 1], [2, 11, 1]],
-        vec![[3, 1, 11], [11, 1, 4], [1, 9, 4], [11, 4, 6]],
-        vec![[6, 11, 1], [11, 8, 1], [8, 0, 1], [4, 6, 1], [9, 4, 1]],
-        vec![[3, 0, 11], [11, 0, 6], [6, 0, 4]],
-        vec![[4, 11, 8], [4, 6, 11]],
-        vec![[6, 8, 7], [10, 8, 6], [9, 8, 10]],
-        vec![[3, 7, 0], [0, 7, 10], [7, 6, 10], [0, 10, 9]],
-        vec![[1, 6, 10], [0, 6, 1], [7, 6, 0], [8, 7, 0]],
-        vec![[10, 1, 6], [6, 1, 7], [7, 1, 3]],
-        vec![[9, 8, 1], [1, 8, 6], [6, 8, 7], [1, 6, 2]],
-        vec![[9, 7, 6], [9, 3, 7], [9, 0, 3], [9, 6, 2], [9, 2, 1]],
-        vec![[7, 6, 8], [8, 6, 0], [0, 6, 2]],
-        vec![[3, 6, 2], [3, 7, 6]],
-        vec![[3, 2, 11], [6, 8, 7], [10, 8, 6], [9, 8, 10]],
-        vec![[7, 9, 0], [7, 10, 9], [7, 6, 10], [7, 0, 2], [7, 2, 11]],
-        vec![[0, 10, 1], [6, 10, 0], [8, 6, 0], [7, 6, 8], [2, 11, 3]],
-        vec![[1, 6, 10], [7, 6, 1], [11, 7, 1], [2, 11, 1]],
-        vec![[1, 9, 6], [9, 8, 6], [8, 7, 6], [3, 1, 6], [11, 3, 6]],
-        vec![[9, 0, 1], [11, 7, 6]],
-        vec![[0, 11, 3], [6, 11, 0], [7, 6, 0], [8, 7, 0]],
-        vec![[7, 6, 11]],
-        vec![[11, 6, 7]],
-        vec![[3, 8, 0], [11, 6, 7]],
-        vec![[1, 0, 9], [6, 7, 11]],
-        vec![[1, 3, 9], [3, 8, 9], [6, 7, 11]],
-        vec![[10, 2, 1], [6, 7, 11]],
-        vec![[10, 2, 1], [3, 8, 0], [6, 7, 11]],
-        vec![[9, 2, 0], [9, 10, 2], [11, 6, 7]],
-        vec![[11, 6, 7], [3, 8, 2], [2, 8, 10], [10, 8, 9]],
-        vec![[2, 6, 3], [6, 7, 3]],
-        vec![[8, 6, 7], [0, 6, 8], [2, 6, 0]],
-        vec![[7, 2, 6], [7, 3, 2], [1, 0, 9]],
-        vec![[8, 9, 7], [7, 9, 2], [2, 9, 1], [7, 2, 6]],
-        vec![[6, 1, 10], [7, 1, 6], [3, 1, 7]],
-        vec![[8, 0, 7], [7, 0, 6], [6, 0, 1], [6, 1, 10]],
-        vec![[7, 3, 6], [6, 3, 9], [3, 0, 9], [6, 9, 10]],
-        vec![[7, 8, 6], [6, 8, 10], [10, 8, 9]],
-        vec![[8, 11, 4], [11, 6, 4]],
-        vec![[11, 0, 3], [6, 0, 11], [4, 0, 6]],
-        vec![[6, 4, 11], [4, 8, 11], [1, 0, 9]],
-        vec![[1, 3, 9], [9, 3, 6], [3, 11, 6], [9, 6, 4]],
-        vec![[8, 11, 4], [11, 6, 4], [1, 10, 2]],
-        vec![[1, 10, 2], [11, 0, 3], [6, 0, 11], [4, 0, 6]],
-        vec![[2, 9, 10], [0, 9, 2], [4, 11, 6], [8, 11, 4]],
-        vec![[3, 4, 9], [3, 6, 4], [3, 11, 6], [3, 9, 10], [3, 10, 2]],
-        vec![[3, 2, 8], [8, 2, 4], [4, 2, 6]],
-        vec![[2, 4, 0], [6, 4, 2]],
-        vec![[0, 9, 1], [3, 2, 8], [8, 2, 4], [4, 2, 6]],
-        vec![[1, 2, 9], [9, 2, 4], [4, 2, 6]],
-        vec![[10, 3, 1], [4, 3, 10], [4, 8, 3], [6, 4, 10]],
-        vec![[10, 0, 1], [6, 0, 10], [4, 0, 6]],
-        vec![[3, 10, 6], [3, 9, 10], [3, 0, 9], [3, 6, 4], [3, 4, 8]],
-        vec![[9, 10, 4], [10, 6, 4]],
-        vec![[9, 4, 5], [7, 11, 6]],
-        vec![[9, 4, 5], [7, 11, 6], [0, 3, 8]],
-        vec![[0, 5, 1], [0, 4, 5], [6, 7, 11]],
-        vec![[11, 6, 7], [4, 3, 8], [5, 3, 4], [1, 3, 5]],
-        vec![[1, 10, 2], [9, 4, 5], [6, 7, 11]],
-        vec![[8, 0, 3], [4, 5, 9], [10, 2, 1], [11, 6, 7]],
-        vec![[7, 11, 6], [10, 4, 5], [2, 4, 10], [0, 4, 2]],
-        vec![[8, 2, 3], [10, 2, 8], [4, 10, 8], [5, 10, 4], [11, 6, 7]],
-        vec![[2, 6, 3], [6, 7, 3], [9, 4, 5]],
-        vec![[5, 9, 4], [8, 6, 7], [0, 6, 8], [2, 6, 0]],
-        vec![[7, 3, 6], [6, 3, 2], [4, 5, 0], [0, 5, 1]],
-        vec![[8, 1, 2], [8, 5, 1], [8, 4, 5], [8, 2, 6], [8, 6, 7]],
-        vec![[9, 4, 5], [6, 1, 10], [7, 1, 6], [3, 1, 7]],
-        vec![[7, 8, 6], [6, 8, 0], [6, 0, 10], [10, 0, 1], [5, 9, 4]],
-        vec![[3, 0, 10], [0, 4, 10], [4, 5, 10], [7, 3, 10], [6, 7, 10]],
-        vec![[8, 6, 7], [10, 6, 8], [5, 10, 8], [4, 5, 8]],
-        vec![[5, 9, 6], [6, 9, 11], [11, 9, 8]],
-        vec![[11, 6, 3], [3, 6, 0], [0, 6, 5], [0, 5, 9]],
-        vec![[8, 11, 0], [0, 11, 5], [5, 11, 6], [0, 5, 1]],
-        vec![[6, 3, 11], [5, 3, 6], [1, 3, 5]],
-        vec![[10, 2, 1], [5, 9, 6], [6, 9, 11], [11, 9, 8]],
-        vec![[3, 11, 0], [0, 11, 6], [0, 6, 9], [9, 6, 5], [1, 10, 2]],
-        vec![[0, 8, 5], [8, 11, 5], [11, 6, 5], [2, 0, 5], [10, 2, 5]],
-        vec![[11, 6, 3], [3, 6, 5], [3, 5, 10], [3, 10, 2]],
-        vec![[3, 9, 8], [6, 9, 3], [5, 9, 6], [2, 6, 3]],
-        vec![[9, 6, 5], [0, 6, 9], [2, 6, 0]],
-        vec![[6, 5, 8], [5, 1, 8], [1, 0, 8], [2, 6, 8], [3, 2, 8]],
-        vec![[2, 6, 1], [6, 5, 1]],
-        vec![[6, 8, 3], [6, 9, 8], [6, 5, 9], [6, 3, 1], [6, 1, 10]],
-        vec![[1, 10, 0], [0, 10, 6], [0, 6, 5], [0, 5, 9]],
-        vec![[3, 0, 8], [6, 5, 10]],
-        vec![[10, 6, 5]],
-        vec![[5, 11, 10], [5, 7, 11]],
-        vec![[5, 11, 10], [5, 7, 11], [3, 8, 0]],
-        vec![[11, 10, 7], [10, 5, 7], [0, 9, 1]],
-        vec![[5, 7, 10], [10, 7, 11], [9, 1, 8], [8, 1, 3]],
-        vec![[2, 1, 11], [11, 1, 7], [7, 1, 5]],
-        vec![[3, 8, 0], [2, 1, 11], [11, 1, 7], [7, 1, 5]],
-        vec![[2, 0, 11], [11, 0, 5], [5, 0, 9], [11, 5, 7]],
-        vec![[2, 9, 5], [2, 8, 9], [2, 3, 8], [2, 5, 7], [2, 7, 11]],
-        vec![[10, 3, 2], [5, 3, 10], [7, 3, 5]],
-        vec![[10, 0, 2], [7, 0, 10], [8, 0, 7], [5, 7, 10]],
-        vec![[0, 9, 1], [10, 3, 2], [5, 3, 10], [7, 3, 5]],
-        vec![[7, 8, 2], [8, 9, 2], [9, 1, 2], [5, 7, 2], [10, 5, 2]],
-        vec![[3, 1, 7], [7, 1, 5]],
-        vec![[0, 7, 8], [1, 7, 0], [5, 7, 1]],
-        vec![[9, 5, 0], [0, 5, 3], [3, 5, 7]],
-        vec![[5, 7, 9], [7, 8, 9]],
-        vec![[4, 10, 5], [8, 10, 4], [11, 10, 8]],
-        vec![[3, 4, 0], [10, 4, 3], [10, 5, 4], [11, 10, 3]],
-        vec![[1, 0, 9], [4, 10, 5], [8, 10, 4], [11, 10, 8]],
-        vec![[4, 3, 11], [4, 1, 3], [4, 9, 1], [4, 11, 10], [4, 10, 5]],
-        vec![[1, 5, 2], [2, 5, 8], [5, 4, 8], [2, 8, 11]],
-        vec![[5, 4, 11], [4, 0, 11], [0, 3, 11], [1, 5, 11], [2, 1, 11]],
-        vec![[5, 11, 2], [5, 8, 11], [5, 4, 8], [5, 2, 0], [5, 0, 9]],
-        vec![[5, 4, 9], [2, 3, 11]],
-        vec![[3, 4, 8], [2, 4, 3], [5, 4, 2], [10, 5, 2]],
-        vec![[5, 4, 10], [10, 4, 2], [2, 4, 0]],
-        vec![[2, 8, 3], [4, 8, 2], [10, 4, 2], [5, 4, 10], [0, 9, 1]],
-        vec![[4, 10, 5], [2, 10, 4], [1, 2, 4], [9, 1, 4]],
-        vec![[8, 3, 4], [4, 3, 5], [5, 3, 1]],
-        vec![[1, 5, 0], [5, 4, 0]],
-        vec![[5, 0, 9], [3, 0, 5], [8, 3, 5], [4, 8, 5]],
-        vec![[5, 4, 9]],
-        vec![[7, 11, 4], [4, 11, 9], [9, 11, 10]],
-        vec![[8, 0, 3], [7, 11, 4], [4, 11, 9], [9, 11, 10]],
-        vec![[0, 4, 1], [1, 4, 11], [4, 7, 11], [1, 11, 10]],
-        vec![[10, 1, 4], [1, 3, 4], [3, 8, 4], [11, 10, 4], [7, 11, 4]],
-        vec![[9, 4, 1], [1, 4, 2], [2, 4, 7], [2, 7, 11]],
-        vec![[1, 9, 2], [2, 9, 4], [2, 4, 11], [11, 4, 7], [3, 8, 0]],
-        vec![[11, 4, 7], [2, 4, 11], [0, 4, 2]],
-        vec![[7, 11, 4], [4, 11, 2], [4, 2, 3], [4, 3, 8]],
-        vec![[10, 9, 2], [2, 9, 7], [7, 9, 4], [2, 7, 3]],
-        vec![[2, 10, 7], [10, 9, 7], [9, 4, 7], [0, 2, 7], [8, 0, 7]],
-        vec![[10, 4, 7], [10, 0, 4], [10, 1, 0], [10, 7, 3], [10, 3, 2]],
-        vec![[8, 4, 7], [10, 1, 2]],
-        vec![[4, 1, 9], [7, 1, 4], [3, 1, 7]],
-        vec![[8, 0, 7], [7, 0, 1], [7, 1, 9], [7, 9, 4]],
-        vec![[0, 7, 3], [0, 4, 7]],
-        vec![[8, 4, 7]],
-        vec![[9, 8, 10], [10, 8, 11]],
-        vec![[3, 11, 0], [0, 11, 9], [9, 11, 10]],
-        vec![[0, 10, 1], [8, 10, 0], [11, 10, 8]],
-        vec![[11, 10, 3], [10, 1, 3]],
-        vec![[1, 9, 2], [2, 9, 11], [11, 9, 8]],
-        vec![[9, 2, 1], [11, 2, 9], [3, 11, 9], [0, 3, 9]],
-        vec![[8, 2, 0], [8, 11, 2]],
-        vec![[11, 2, 3]],
-        vec![[2, 8, 3], [10, 8, 2], [9, 8, 10]],
-        vec![[0, 2, 9], [2, 10, 9]],
-        vec![[3, 2, 8], [8, 2, 10], [8, 10, 1], [8, 1, 0]],
-        vec![[1, 2, 10]],
-        vec![[3, 1, 8], [1, 9, 8]],
-        vec![[9, 0, 1]],
-        vec![[3, 0, 8]],
-        vec![],
-    ];
-    let vertices = [
-        (0, 0, 0),
-        (1, 0, 0),
-        (1, 1, 0),
-        (0, 1, 0),
-        (0, 0, 1),
-        (1, 0, 1),
-        (1, 1, 1),
-        (0, 1, 1),
-    ];
 
-    let edges = [
-        (0, 1),
-        (1, 2),
-        (2, 3),
-        (3, 0),
-        (4, 5),
-        (5, 6),
-        (6, 7),
-        (7, 4),
-        (0, 4),
-        (1, 5),
-        (2, 6),
-        (3, 7),
-    ];
+fn cube_march_cpu() -> Vec<[[f32; 3]; 3]> {
+    fn sdf(x: usize, y: usize, z: usize) -> f32 {
+        let x = (x as f32 / 2.0) % 30.0 - 15.0;
+        let y = (y as f32 / 2.0) % 30.0 - 15.0;
+        let z = (z as f32 / 2.0) % 30.0 - 15.0;
 
-    fn sdf(x: usize, y: usize, z: usize) -> u8 {
-        let x = x as f32 / 2.0;
-        let y = y as f32 / 2.0;
-        let z = z as f32 / 2.0;
-
-        (x.sin() * y.cos() * z.sin().cos() > 0.0) as u8
+        (x * x + y * y + z * z) - 10.0 * 10.0
     }
-    let mut map: HashMap<u8, usize> = HashMap::new();
+
+    let cases = gen_cases();
+
+    let mut tris: Vec<[[f32; 3]; 3]> = Vec::new();
+
+    let size = 400;
 
     for x in 0..size {
         for y in 0..size {
             for z in 0..size {
                 let mut idx = 0;
-                idx |= sdf(x + 0, y + 0, z + 0) << 0;
-                idx |= sdf(x + 0, y + 0, z + 1) << 1;
-                idx |= sdf(x + 0, y + 1, z + 0) << 2;
-                idx |= sdf(x + 0, y + 1, z + 1) << 3;
-                idx |= sdf(x + 1, y + 0, z + 0) << 4;
-                idx |= sdf(x + 1, y + 0, z + 1) << 5;
-                idx |= sdf(x + 1, y + 1, z + 0) << 6;
-                idx |= sdf(x + 1, y + 1, z + 1) << 7;
-                *map.entry(idx).or_default() += 1;
+                //     .4------5
+                //   .' |    .'|
+                //  6---+--7'  |
+                //  |   |  |   |
+                //  |  .0--+---1
+                //  |.'    | .'
+                //  2------3'
+                //
+                //      z
+                //      |
+                //      |
+                //      |
+                //     .0------x
+                //   .'
+                //  y
+                let s = [
+                    sdf(x + 0, y + 0, z + 0),
+                    sdf(x + 1, y + 0, z + 0),
+                    sdf(x + 0, y + 1, z + 0),
+                    sdf(x + 1, y + 1, z + 0),
+                    sdf(x + 0, y + 0, z + 1),
+                    sdf(x + 1, y + 0, z + 1),
+                    sdf(x + 0, y + 1, z + 1),
+                    sdf(x + 1, y + 1, z + 1),
+                ];
+                for (i, &s) in s.iter().enumerate() {
+                    idx |= ((s>0.0) as u8) << i;
+                }
 
-                // for face in &cases[idx] {
+                let x = (x as f32) * 2.0 - (size - 1) as f32;
+                let y = (y as f32) * 2.0 - (size - 1) as f32;
+                let z = (z as f32) * 2.0 - (size - 1) as f32;
+                // tris.push(
+                //     [[0.0, 1.0, 0.0], [-1.0, -1.0, 0.0], [1.0, -1.0, 0.0]].map(|[px, py, pz]| {
+                //         [px + x, py + y, pz + z].map(|e| e * (1.0 / size as f32))
+                //     }),
+                // );
+                tris.extend(cases[idx as usize].iter().copied().map(|tri| {
+                    tri.map(|i| {
+                        let [(sa, [ax, ay, az]), (sb, [bx, by, bz])] =
+                            EDGES[i].map(|vertex| (s[vertex], VERTS[vertex].map(|v| v as f32)));
+                        let sa = sa.abs();
+                        let sb = sb.abs();
+                        let sa = sa / (sa + sb);
+                        let sb = 1.0 - sa;
+                        let (sa, sb) = (2.0 * sb, 2.0 * sa);
+                        [sa * ax + sb * bx, sa * ay + sb * by, sa * az + sb * bz].map(|e| e * 0.5)
+                    })
+                    .map(|[px, py, pz]| {
+                        // println!("[{px}, {py}, {pz}]");
+                        [x + px, y + py, z + pz].map(|e| e / size as f32)
+                    })
 
-                // }
+                    // tri.map(|[px, py, pz]| {
+                    //     // println!("[{px}, {py}, {pz}]");
+                    //     [x + px, y + py, z + pz].map(|e| e / size as f32)
+                    // })
+                }))
             }
         }
     }
-    println!("{map:?}");
+    dbg!(tris.len());
+    tris
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct CameraUniform {
+    view_proj: [[f32; 4]; 4],
+}
+impl CameraUniform {
+    fn from_camera(camera: &Camera) -> Self {
+        Self {
+            view_proj: camera.view_projection_matrix().into(),
+        }
+    }
+}
+struct Camera {
+    // camera pos
+    eye: cgmath::Point3<f32>,
+    // point camera is looking at
+    target: cgmath::Point3<f32>,
+    up: cgmath::Vector3<f32>,
+    aspect: f32,
+    fovy: f32,
+    znear: f32,
+    zfar: f32,
+}
+impl Camera {
+    #[rustfmt::skip]
+    const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::new(
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 0.5, 0.5,
+        0.0, 0.0, 0.0, 1.0,
+    );
+    fn view_projection_matrix(&self) -> cgmath::Matrix4<f32> {
+        // move world to camera pos/rot
+        let view = cgmath::Matrix4::look_at_rh(self.eye, self.target, self.up);
+        // projection matrix
+        let proj = cgmath::perspective(cgmath::Deg(self.fovy), self.aspect, self.znear, self.zfar);
+        // "normalized device coordinates" is different from OpenGL.
+        Self::OPENGL_TO_WGPU_MATRIX * proj * view
+    }
+    fn new(surface_config: &wgpu::SurfaceConfiguration) -> Self {
+        Self {
+            eye: (0.0, 1.0, 2.0).into(),
+            target: (0.0, 0.0, 0.0).into(),
+            up: cgmath::Vector3::unit_y(),
+            aspect: surface_config.width as f32 / surface_config.height as f32,
+            fovy: 45.0,
+            znear: 0.1,
+            zfar: 100.0,
+        }
+    }
+}
+
+struct Texture {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+}
+impl Texture {
+    const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+    fn new_depth(device: &wgpu::Device, surface_config: &wgpu::SurfaceConfiguration) -> Self {
+        let size = wgpu::Extent3d {
+            width: surface_config.width,
+            height: surface_config.height,
+            depth_or_array_layers: 1,
+        };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: Self::DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+
+        let view = texture.create_view(&default());
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: None,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            lod_min_clamp: 0.0,
+            lod_max_clamp: 100.0,
+            ..default()
+        });
+
+        Self {
+            texture,
+            view,
+            sampler,
+        }
+    }
 }
 
 fn main() {
@@ -552,7 +409,10 @@ fn main() {
     std::env::set_var("RUST_BACKTRACE", "1");
     cube_march_cpu();
     let event_loop = EventLoop::new().unwrap();
-    let window = WindowBuilder::new().build(&event_loop).unwrap();
+    let window = WindowBuilder::new()
+        .with_title("Marching Cubes")
+        .build(&event_loop)
+        .unwrap();
     let window = &window;
 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -593,7 +453,7 @@ fn main() {
         format: surface_format,
         width: 200,
         height: 200,
-        present_mode: dbg!(&surface_caps.present_modes)[0],
+        present_mode: wgpu::PresentMode::Immediate, //dbg!(&surface_caps.present_modes)[0],
         desired_maximum_frame_latency: 2,
         alpha_mode: dbg!(&surface_caps.alpha_modes)[0],
         view_formats: vec![],
@@ -626,31 +486,7 @@ fn main() {
     //     multiview: todo!(),
     // });
 
-    let shader_source = "
-    struct VertexInput {
-        @location(0) position: vec3<f32>,
-        @builtin(vertex_index) in_vertex_index: u32,
-    };
-    struct VertexOutput {
-        @builtin(position) clip_position: vec4<f32>,
-        // @location(0) color: vec3<f32>,
-    };
-    
-    @vertex
-    fn vs_main(
-        model: VertexInput,
-    ) -> VertexOutput {
-        var out: VertexOutput;
-        out.clip_position = vec4<f32>(model.position, 1.0);
-        return out;
-    }
-    
-    @fragment
-    fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-        return vec4<f32>(0.3, 0.2, 0.1, 1.0);
-    }
-    
-    ";
+    let shader_source = include_str!("shader.wgsl");
 
     let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: None,
@@ -667,7 +503,23 @@ fn main() {
         Vertex {
             pos: [0.5, -0.5, 0.0],
         },
+        Vertex {
+            pos: [0.5, 0.5, 0.0],
+        },
+        Vertex {
+            pos: [1.0, -0.5, 0.0],
+        },
+        Vertex {
+            pos: [0.0, -0.5, 0.0],
+        },
     ];
+
+    let vert = VERT;
+    let vert: Vec<Vertex> = cube_march_cpu()
+        .into_iter()
+        .flat_map(|v| v.map(|v| Vertex { pos: v }))
+        .collect(); // VERT;
+    let num_vert = vert.len() as u32;
 
     let vertex_buffer_layout = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<Vertex>() as _,
@@ -677,15 +529,52 @@ fn main() {
 
     let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: None,
-        contents: bytemuck::cast_slice(VERT),
+        contents: bytemuck::cast_slice(&vert),
         usage: wgpu::BufferUsages::VERTEX,
     });
 
+    let t0 = Instant::now();
+    let mut last_time = Instant::now();
+    let mut last_count = 0;
+    let mut camera = Camera::new(&surface_config);
+    let mut camera_uniform = CameraUniform::from_camera(&camera);
+
+    let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: None,
+        contents: bytemuck::cast_slice(&[camera_uniform]),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+
+    let camera_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+    let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &camera_bind_group_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: camera_buffer.as_entire_binding(),
+        }],
+    });
     let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: None,
-        bind_group_layouts: &[],
+        bind_group_layouts: &[&camera_bind_group_layout],
         push_constant_ranges: &[],
     });
+
+    let mut depth_texture = Texture::new_depth(&device, &surface_config);
 
     let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: None,
@@ -704,7 +593,13 @@ fn main() {
             polygon_mode: wgpu::PolygonMode::Fill,
             conservative: false,
         },
-        depth_stencil: None,
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: Texture::DEPTH_FORMAT,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
         multisample: wgpu::MultisampleState {
             count: 1,
             mask: !0,
@@ -752,22 +647,46 @@ fn main() {
                                             store: wgpu::StoreOp::Store,
                                         },
                                     })],
-                                    depth_stencil_attachment: None,
+                                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                                        view: &depth_texture.view,
+                                        depth_ops: Some(wgpu::Operations {
+                                            load: wgpu::LoadOp::Clear(1.0),
+                                            store: wgpu::StoreOp::Store
+                                        }),
+                                        stencil_ops: None,
+                                    }),
                                     timestamp_writes: None,
                                     occlusion_query_set: None,
                                 });
                                 render_pass.set_pipeline(&render_pipeline);
                                 render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-                                render_pass.draw(0..3, 0..1);
+                                render_pass.set_bind_group(0, &camera_bind_group, &[]);
+                                render_pass.draw(0..num_vert, 0..1);
                             }
+                            camera = Camera::new(&surface_config);
+                            let t = t0.elapsed().as_secs_f32();
+                            camera.eye = (2.0 * t.sin(), 0.0, 2.0 * t.cos()).into();
+                            camera_uniform = CameraUniform::from_camera(&camera);
+                            queue.write_buffer(&camera_buffer, 0, bytemuck::cast_slice(&[camera_uniform]));
                             queue.submit([encoder.finish()]);
                             output.present();
+                            window.request_redraw();
+                            let elapsed = last_time.elapsed().as_secs_f64();
+                            last_count += 1;
+                            if elapsed > 1.0 {
+                                let fps = last_count as f64 / elapsed;
+                                println!("FPS: {fps}");
+
+                                last_count = 0;
+                                last_time = Instant::now();
+                            }
                         }
                         WindowEvent::Resized(size) => {
                             if size.width > 0 && size.height > 0 {
                                 surface_config.width = size.width;
                                 surface_config.height = size.height;
                                 surface.configure(&device, &surface_config);
+                                depth_texture = Texture::new_depth(&device, &surface_config);
                             }
                         }
                         _ => (),
