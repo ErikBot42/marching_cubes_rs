@@ -29,7 +29,6 @@ fn vs_main(
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     //return vec4<f32>(abs(sin(in.clip_position.z * 10.0)), 0.2, 0.1, 1.0);
 
-
     let c: vec3<f32> = in.clip_position.xyz;
 
     let dx = dpdx(in.world_pos);
@@ -46,5 +45,4 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     //return vec4<f32>(sin(in.clip_position.z * 400.0) * 0.5 + 0.25, 0.0, 0.0, 1.0);
 }
-
 

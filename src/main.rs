@@ -1,6 +1,6 @@
 use std::{
     cmp::Eq,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     hash::Hash,
     marker::Copy,
     mem::{transmute, MaybeUninit},
@@ -53,6 +53,8 @@ const EDGES: [[usize; 2]; 12] = [
     [2, 6],
     [3, 7],
 ];
+
+// ... -(vertex shader)> triangle + index.
 
 fn gen_cases() -> [Vec<[usize; 3]>; 256] {
     //
@@ -190,7 +192,175 @@ fn gen_cases() -> [Vec<[usize; 3]>; 256] {
     //         })
     //         .collect()
     // });
-    found.map(|f| f.unwrap())
+    let found = found.map(|f| f.unwrap());
+    println!("{:?}", &found);
+    println!("{:?}", found.clone().map(|f| f.len()));
+    let flattened: Vec<_> = found.iter().cloned().flatten().collect();
+    println!("{:?}", &flattened);
+    println!("{:?}", flattened.len());
+    {
+        let set: HashSet<_> = found
+            .iter()
+            .flatten()
+            .map(|&x| {
+                let mut x = x;
+                x.sort();
+                x
+            })
+            .collect();
+
+        dbg!(&set);
+        //panic!("tris: {}", set.len());
+    }
+    found
+}
+
+struct MetaBuffer {
+    buffer: wgpu::Buffer,
+    bytes: u64,
+    ty: wgpu::BufferBindingType,
+}
+impl MetaBuffer {
+    fn new(device: &wgpu::Device, name: &str, contents: &[u8]) -> Self {
+        Self::new_i(
+            device,
+            name,
+            wgpu::BufferBindingType::Storage { read_only: false },
+            wgpu::BufferUsages::STORAGE,
+            bytemuck::cast_slice(contents),
+        )
+    }
+    fn new_constant<T: bytemuck::NoUninit>(
+        device: &wgpu::Device,
+        name: &str,
+        contents: &[T],
+    ) -> Self {
+        Self::new_i(
+            device,
+            name,
+            wgpu::BufferBindingType::Storage { read_only: true },
+            wgpu::BufferUsages::STORAGE,
+            bytemuck::cast_slice(contents),
+        )
+    }
+    fn new_uniform<T: Default + bytemuck::NoUninit>(device: &wgpu::Device) -> Self {
+        let data = T::default();
+        Self::new_i(
+            device,
+            &format!("{} uniform buffer", std::any::type_name::<T>()),
+            wgpu::BufferBindingType::Uniform,
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            bytemuck::cast_slice(&[data]),
+        )
+    }
+    fn new_i(
+        device: &wgpu::Device,
+        name: &str,
+        ty: wgpu::BufferBindingType,
+        usage: wgpu::BufferUsages,
+        contents: &[u8],
+    ) -> Self {
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(name),
+            contents,
+            usage,
+        });
+        Self {
+            buffer,
+            bytes: contents.len() as u64,
+            ty,
+        }
+    }
+    fn binding_layout(&self, binding: u32) -> wgpu::BindGroupLayoutEntry {
+        wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: self.ty,
+                has_dynamic_offset: false,
+                min_binding_size: std::num::NonZeroU64::new(self.bytes),
+            },
+            count: None,
+        }
+    }
+    fn binding(&self, binding: u32) -> wgpu::BindGroupEntry {
+        wgpu::BindGroupEntry {
+            binding,
+            resource: self.buffer.as_entire_binding(),
+        }
+    }
+    fn write<T: bytemuck::NoUninit>(&self, queue: wgpu::Queue, data: T) {
+        queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&[data]));
+    }
+}
+
+macro_rules! source {
+    ($filename:expr) => {{
+        #[cfg(debug_assertions)]
+        ($filename, &std::fs::read_to_string(concat!("src/",$filename,".wgsl")))
+        #[cfg(not(debug_assertions))]
+        ($filename, include_str!(concat!($filename, ".wgsl")))
+    }};
+}
+
+struct Kernel {
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    x: u32,
+    y: u32,
+    z: u32,
+}
+impl Kernel {
+    fn new(
+        device: &wgpu::Device,
+        (name, source): (&str, &str),
+        buffers: &[&MetaBuffer],
+        x: u32,
+        y: u32,
+        z: u32,
+    ) -> Self {
+        let (binding_entry_layouts, binding_entries): (Vec<_>, Vec<_>) = buffers
+            .iter()
+            .zip(0..)
+            .map(|(buffer, i)| (buffer.binding_layout(i), buffer.binding(i)))
+            .unzip();
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(&format!("{name} bind group layout")),
+            entries: &binding_entry_layouts,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(&format!("{name} bind group")),
+            layout: &bind_group_layout,
+            entries: &binding_entries,
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(&format!("{name} pipeline layout")),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(&format!("{name} shader module")),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(source)),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(&format!("{name} compute pipeline")),
+            layout: Some(&pipeline_layout),
+            module: &shader_module,
+            entry_point: "main",
+        });
+        Self {
+            pipeline,
+            bind_group,
+            x,
+            y,
+            z,
+        }
+    }
+    fn dispatch<'s: 'c, 'c>(&'s self, pass: &mut wgpu::ComputePass<'c>) {
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.dispatch_workgroups(self.x, self.y, self.z);
+    }
 }
 
 trait SearchExt<T: Copy + Eq> {
@@ -218,8 +388,39 @@ fn cmap<U: Copy, V: Copy, const N: usize>(a: [U; N], f: fn(U) -> V, v_default: V
     }
     output
 }
+// plan:
+// gen u8 from sdf, calc number of verts per cell.
+// prefix sum verts per cell
+// draw the sum of verts of vertices?
+//
+//
+// passes:
+// gen verts/cell + start prefix sum
 
+fn indexify(v: &[[f32; 3]]) -> (Vec<[f32; 3]>, Vec<u32>) {
+    let mut idxs = Vec::new();
+    let mut data = Vec::new();
 
+    // slow but fine for cpu testing.
+    let mut map: HashMap<[u32; 3], usize> = HashMap::new();
+
+    for &v in v {
+        let id = {
+            let vb = v.map(|v| v.to_bits());
+            if let Some(id) = map.get(&vb) {
+                *id
+            } else {
+                let l = map.len();
+                map.insert(vb, l);
+                data.push(v);
+                l
+            }
+        };
+        idxs.push(id as _);
+    }
+
+    (data, idxs)
+}
 
 fn cube_march_cpu() -> Vec<[[f32; 3]; 3]> {
     fn sdf(x: usize, y: usize, z: usize) -> f32 {
@@ -227,14 +428,14 @@ fn cube_march_cpu() -> Vec<[[f32; 3]; 3]> {
         let y = (y as f32 / 2.0) % 30.0 - 15.0;
         let z = (z as f32 / 2.0) % 30.0 - 15.0;
 
-        (x * x + y * y + z * z) - 10.0 * 10.0
+        (x * x + y * y + z * z).sqrt() - 10.0
     }
 
     let cases = gen_cases();
 
     let mut tris: Vec<[[f32; 3]; 3]> = Vec::new();
 
-    let size = 400;
+    let size = 32;
 
     for x in 0..size {
         for y in 0..size {
@@ -255,18 +456,19 @@ fn cube_march_cpu() -> Vec<[[f32; 3]; 3]> {
                 //     .0------x
                 //   .'
                 //  y
+                let scale = size as f32;
                 let s = [
-                    sdf(x + 0, y + 0, z + 0),
-                    sdf(x + 1, y + 0, z + 0),
-                    sdf(x + 0, y + 1, z + 0),
-                    sdf(x + 1, y + 1, z + 0),
-                    sdf(x + 0, y + 0, z + 1),
-                    sdf(x + 1, y + 0, z + 1),
-                    sdf(x + 0, y + 1, z + 1),
-                    sdf(x + 1, y + 1, z + 1),
+                    sdf(x + 0, y + 0, z + 0).clamp(-0.5, 0.5),
+                    sdf(x + 1, y + 0, z + 0).clamp(-0.5, 0.5),
+                    sdf(x + 0, y + 1, z + 0).clamp(-0.5, 0.5),
+                    sdf(x + 1, y + 1, z + 0).clamp(-0.5, 0.5),
+                    sdf(x + 0, y + 0, z + 1).clamp(-0.5, 0.5),
+                    sdf(x + 1, y + 0, z + 1).clamp(-0.5, 0.5),
+                    sdf(x + 0, y + 1, z + 1).clamp(-0.5, 0.5),
+                    sdf(x + 1, y + 1, z + 1).clamp(-0.5, 0.5),
                 ];
                 for (i, &s) in s.iter().enumerate() {
-                    idx |= ((s>0.0) as u8) << i;
+                    idx |= ((s > 0.0) as u8) << i;
                 }
 
                 let x = (x as f32) * 2.0 - (size - 1) as f32;
@@ -404,12 +606,27 @@ impl Texture {
     }
 }
 
+struct State<'a> {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    instance: wgpu::Instance,
+    surface: wgpu::Surface<'a>,
+}
+impl<'a> State<'a> {
+    fn new(window: &'a winit::window::Window) -> Self {
+
+        todo!()
+    }
+    fn render(&mut self) {}
+    fn resize(&mut self, width: u32, height: u32) {}
+}
+
 fn main() {
     env_logger::init();
     std::env::set_var("RUST_BACKTRACE", "1");
-    cube_march_cpu();
+    //cube_march_cpu();
     let event_loop = EventLoop::new().unwrap();
-    let window = WindowBuilder::new()
+    let window: winit::window::Window = WindowBuilder::new()
         .with_title("Marching Cubes")
         .build(&event_loop)
         .unwrap();
@@ -436,7 +653,7 @@ fn main() {
     //     compatible_surface: todo!(),
     // });
 
-    let surface = instance.create_surface(window).unwrap();
+    let surface: wgpu::Surface<'_> = instance.create_surface(window).unwrap();
     let adapter = dbg!(adapters)
         .into_iter()
         .find(|a| dbg!(a).is_surface_supported(&surface))
@@ -515,11 +732,16 @@ fn main() {
     ];
 
     let vert = VERT;
-    let vert: Vec<Vertex> = cube_march_cpu()
-        .into_iter()
-        .flat_map(|v| v.map(|v| Vertex { pos: v }))
-        .collect(); // VERT;
+    let vert: Vec<_> = cube_march_cpu().into_iter().flatten().collect(); // VERT;
     let num_vert = vert.len() as u32;
+
+    let _ = indexify(&vert);
+
+    let compact_vertex_buffer_layout = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<Vertex>() as _,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+    };
 
     let vertex_buffer_layout = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<Vertex>() as _,
@@ -665,7 +887,7 @@ fn main() {
                             }
                             camera = Camera::new(&surface_config);
                             let t = t0.elapsed().as_secs_f32();
-                            camera.eye = (2.0 * t.sin(), 0.0, 2.0 * t.cos()).into();
+                            camera.eye = (2.0 * t.sin(), (t*2.0_f32.sqrt()*0.5).sin()*0.1, 2.0 * t.cos()).into();
                             camera_uniform = CameraUniform::from_camera(&camera);
                             queue.write_buffer(&camera_buffer, 0, bytemuck::cast_slice(&[camera_uniform]));
                             queue.submit([encoder.finish()]);
