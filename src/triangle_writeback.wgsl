@@ -13,9 +13,9 @@ const case_triangle_offset: array<u32> = array(...);
 
 const case_triangle_number: array<u32> = array(...);
 
-const case_triangle_edges: array<array<u32, 3>> = array(...);
+// const case_triangle_edges: array<array<u32, 3>> = array(...);
 
-const case_edges: array<u32> = array(...);
+// const case_edges: array<u32> = array(...);
 
 @group(0) @binding(0)
 var<storage, read_write> sdf_data: array<f32>; 
@@ -87,7 +87,7 @@ fn main(
         let case_data_idx = case_triangle_offset[idx] + i;
 
         let triangle = case_triangle_number[case_data_idx];
-        let edges = case_triangle_edges[case_data_idx];
+        // let edges = case_triangle_edges[case_data_idx];
 
         var bit = 0;
         bit |= triangle;

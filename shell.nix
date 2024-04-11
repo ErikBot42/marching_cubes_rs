@@ -38,6 +38,7 @@ shaderc.bin
 shaderc.static
 shaderc.dev
 shaderc.lib
+#renderdoc
 ];
 LD_LIBRARY_PATH = "${lib.makeLibraryPath buildInputs}";
 VK_LAYER_PATH = "${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d";

@@ -1,9 +1,11 @@
 use std::{
+    array,
     cmp::Eq,
     collections::{HashMap, HashSet, VecDeque},
     hash::Hash,
     marker::Copy,
     mem::{transmute, MaybeUninit},
+    ops::Index,
     time::Instant,
 };
 
@@ -24,39 +26,35 @@ fn default<T: Default>() -> T {
 struct Vertex {
     pos: [f32; 3],
 }
-const fn arr_len<T: Copy, const N: usize>(a: [T; N]) -> usize {
-    N
-}
-
-const VERTS: [[i32; 3]; 8] = [
-    [-1, -1, -1],
-    [1, -1, -1],
-    [-1, 1, -1],
-    [1, 1, -1],
-    [-1, -1, 1],
-    [1, -1, 1],
-    [-1, 1, 1],
-    [1, 1, 1],
-];
-
-const EDGES: [[usize; 2]; 12] = [
-    [0, 1],
-    [2, 3],
-    [4, 5],
-    [6, 7],
-    [0, 2],
-    [1, 3],
-    [4, 6],
-    [5, 7],
-    [0, 4],
-    [1, 5],
-    [2, 6],
-    [3, 7],
-];
 
 // ... -(vertex shader)> triangle + index.
 
-fn gen_cases() -> [Vec<[usize; 3]>; 256] {
+fn gen_cases() -> Box<CubeMarch> {
+    const VERTS: [[i32; 3]; 8] = [
+        [-1, -1, -1],
+        [1, -1, -1],
+        [-1, 1, -1],
+        [1, 1, -1],
+        [-1, -1, 1],
+        [1, -1, 1],
+        [-1, 1, 1],
+        [1, 1, 1],
+    ];
+
+    const EDGES: [[usize; 2]; 12] = [
+        [0, 1],
+        [2, 3],
+        [4, 5],
+        [6, 7],
+        [0, 2],
+        [1, 3],
+        [4, 6],
+        [5, 7],
+        [0, 4],
+        [1, 5],
+        [2, 6],
+        [3, 7],
+    ];
     //
     //     .4------5
     //   .' |    .'|
@@ -82,7 +80,7 @@ fn gen_cases() -> [Vec<[usize; 3]>; 256] {
                 mtx[1][0] * v[0] + mtx[1][1] * v[1] + mtx[1][2] * v[2],
                 mtx[2][0] * v[0] + mtx[2][1] * v[1] + mtx[2][2] * v[2],
             ];
-            verts.index(transformed)
+            verts.indexof(transformed)
         });
         v
     }
@@ -97,18 +95,18 @@ fn gen_cases() -> [Vec<[usize; 3]>; 256] {
     ]
     .map(|m| make_transform(&VERTS, m));
 
-    let s01: usize = 0;
-    let s23: usize = 1;
-    let s45: usize = 2;
-    let s67: usize = 3;
-    let s02: usize = 4;
-    let s13: usize = 5;
-    let s46: usize = 6;
-    let s57: usize = 7;
-    let s04: usize = 8;
-    let s15: usize = 9;
-    let s26: usize = 10;
-    let s37: usize = 11;
+    let s01: usize = EDGES.indexof([0, 1]);
+    let s23: usize = EDGES.indexof([2, 3]);
+    let s45: usize = EDGES.indexof([4, 5]);
+    let s67: usize = EDGES.indexof([6, 7]);
+    let s02: usize = EDGES.indexof([0, 2]);
+    let s13: usize = EDGES.indexof([1, 3]);
+    let s46: usize = EDGES.indexof([4, 6]);
+    let s57: usize = EDGES.indexof([5, 7]);
+    let s04: usize = EDGES.indexof([0, 4]);
+    let s15: usize = EDGES.indexof([1, 5]);
+    let s26: usize = EDGES.indexof([2, 6]);
+    let s37: usize = EDGES.indexof([3, 7]);
 
     let t0: usize = 1 << 0;
     let t1: usize = 1 << 1;
@@ -130,7 +128,7 @@ fn gen_cases() -> [Vec<[usize; 3]>; 256] {
 
     // created manually from the cases presented on wikipedia
     #[rustfmt::skip]
-    let mut front: VecDeque<_> = [
+    let cases = [
         (0, vec![]),
         (t2, vec![[s02, s23, s26]]),
         (t2|t3, vec![[s02, s13, s26], [s26, s37, s13]]),
@@ -148,7 +146,8 @@ fn gen_cases() -> [Vec<[usize; 3]>; 256] {
         (t6|t5|t3, vec![[s46, s67, s26], [s15, s57, s45], [s37, s13, s23]]),
         (t2|t6|t1|t5, vec![[s46, s02, s23], [s46, s67, s23], [s45, s57, s13], [s01, s13, s45]]),
         (t1|t5|t2|t0, vec![[s45, s57, s04], [s26, s23, s04], [s04, s57, s23], [s13, s23, s57]]),
-    ].into_iter().collect();
+    ];
+    let mut front: VecDeque<_> = cases.into_iter().collect();
 
     let mut found: [_; 256] = std::array::from_fn(|_| None);
 
@@ -172,7 +171,7 @@ fn gen_cases() -> [Vec<[usize; 3]>; 256] {
                             let mut transformed =
                                 EDGES[edge_vertex].map(|vertex| transform[vertex]);
                             transformed.sort();
-                            EDGES.index(transformed)
+                            EDGES.indexof(transformed)
                         })
                     })
                     .collect();
@@ -192,28 +191,137 @@ fn gen_cases() -> [Vec<[usize; 3]>; 256] {
     //         })
     //         .collect()
     // });
-    let found = found.map(|f| f.unwrap());
+    let found = found.map(|f| {
+        let mut f = f.unwrap();
+        f.iter_mut().for_each(|f| f.sort());
+        f
+    });
     println!("{:?}", &found);
     println!("{:?}", found.clone().map(|f| f.len()));
     let flattened: Vec<_> = found.iter().cloned().flatten().collect();
     println!("{:?}", &flattened);
     println!("{:?}", flattened.len());
-    {
-        let set: HashSet<_> = found
-            .iter()
-            .flatten()
-            .map(|&x| {
-                let mut x = x;
-                x.sort();
-                x
-            })
-            .collect();
+    let triangle_to_edge = {
+        let mut f: Vec<_> = found.iter().flatten().copied().collect();
+        f.sort();
+        f.dedup();
+        collect_arr(f.into_iter())
+    };
+    let found = found.map(|f| {
+        f.into_iter()
+            .map(|f| triangle_to_edge.indexof(f))
+            .collect::<Vec<_>>()
+    });
 
-        dbg!(&set);
-        //panic!("tris: {}", set.len());
-    }
-    found
+    let mut prefix = 0;
+
+    let case_to_offset = array::from_fn(|i| {
+        prefix += found.get(i.wrapping_sub(1)).map(|i| i.len()).unwrap_or(0);
+        prefix
+    });
+    let case_to_size = array::from_fn(|i| found[i].len());
+    // 732 135
+    let offset_to_triangle = collect_arr(found.iter().flat_map(|v| v.iter()).copied());
+    // 732 135
+    //panic!("{} {}", offset_to_triangle.len(), triangle_to_edge.len());
+    Box::new(CubeMarch {
+        case_to_offset,
+        offset_to_triangle,
+        triangle_to_edge,
+        edge_to_corner: EDGES,
+        corner_to_pos: VERTS,
+        case_to_size,
+    })
 }
+
+fn collect_arr<const N: usize, T>(mut i: impl Iterator<Item = T>) -> [T; N] {
+    let arr = std::array::from_fn(|_| i.next().unwrap());
+    assert!(i.next().is_none());
+    arr
+}
+
+/// All the LUTs for cube maching
+/// The uniforms denormalize this.
+struct CubeMarch {
+    // case -> size
+    case_to_size: [usize; 256],
+    // case -> offset
+    case_to_offset: [usize; 257],
+    // offsets -> triangle
+    offset_to_triangle: [usize; 732],
+    // triangle -> 3*edge.
+    triangle_to_edge: [[usize; 3]; 135],
+    // edge -> 2*vertex.
+    edge_to_corner: [[usize; 2]; 12],
+    // vertex -> normalized position.
+    corner_to_pos: [[i32; 3]; 8],
+}
+struct TriAllocUniform {
+    // 3 bit (0..=4)
+    case_to_size: [u32; 256],
+}
+impl TriAllocUniform {
+    fn new(case: &CubeMarch) -> Self {
+        Self {
+            case_to_size: case.case_to_size.map(|size| size as u32),
+        }
+    }
+}
+struct TriWriteBackUniform {
+    /// triangle lives on 3 edges
+    /// each edge is on 2 corners
+    /// edge0 edge1, edge2
+    /// XYZ XYZ XYZ XYZ XYZ XYZ TRIA = 22 significant bits
+    offset_to_corners_and_triangle: [u32; 732],
+    /// 10 bit (0..732)
+    case_to_offset: [u32; 257],
+    /// Padding
+    _unused0: u32,
+    /// Padding
+    _unused1: u32,
+    /// Padding
+    _unused2: u32,
+}
+impl TriWriteBackUniform {
+    fn new(case: &CubeMarch) -> Self {
+        Self {
+            offset_to_corners_and_triangle: case.offset_to_triangle.map(|triangle| {
+                let [a, b, c] = case.triangle_to_edge[triangle].map(|edge| {
+                    let [a, b] = case.edge_to_corner[edge];
+                    (a as u32) | ((b as u32) << 3)
+                });
+                let triangle = triangle as u32;
+                a | (b << 6) | (c << 12) | (triangle << 18)
+            }),
+            case_to_offset: case.case_to_offset.map(|offset| offset as u32),
+            _unused0: 0,
+            _unused1: 0,
+            _unused2: 0,
+        }
+    }
+}
+struct RenderCaseUniform {
+    /// XYZ XYZ XYZ XYZ XYZ XYZ = 18 bit
+    triangle_to_corners: [u32; 135],
+    /// Padding
+    _unused0: u32,
+}
+impl RenderCaseUniform {
+    fn new(case: &CubeMarch) -> Self {
+        Self {
+            triangle_to_corners: case.triangle_to_edge.map(|edges| {
+                let [a, b, c] = edges.map(|edge| {
+                    let [a, b] = case.edge_to_corner[edge];
+                    (a as u32) | ((b as u32) << 3)
+                });
+                a | (b << 6) | (c << 12)
+            }),
+            _unused0: 0,
+        }
+    }
+}
+
+struct CubeMarchUniform {}
 
 struct MetaBuffer {
     buffer: wgpu::Buffer,
@@ -221,7 +329,7 @@ struct MetaBuffer {
     ty: wgpu::BufferBindingType,
 }
 impl MetaBuffer {
-    fn new(device: &wgpu::Device, name: &str, contents: &[u8]) -> Self {
+    fn new<T: bytemuck::NoUninit>(device: &wgpu::Device, name: &str, contents: &[T]) -> Self {
         Self::new_i(
             device,
             name,
@@ -294,12 +402,22 @@ impl MetaBuffer {
     }
 }
 
+#[derive(Default, Copy, Clone, bytemuck::NoUninit)]
+#[repr(C)]
+struct ChunkUniform {
+    x: i32,
+    y: i32,
+    z: i32,
+    write_offset: u32,
+}
+
+#[rustfmt::skip]
 macro_rules! source {
     ($filename:expr) => {{
         #[cfg(debug_assertions)]
-        ($filename, &std::fs::read_to_string(concat!("src/",$filename,".wgsl")))
+        { ($filename, &std::fs::read_to_string(concat!("src/",$filename,".wgsl")).unwrap()) }
         #[cfg(not(debug_assertions))]
-        ($filename, include_str!(concat!($filename, ".wgsl")))
+        { ($filename, include_str!(concat!($filename, ".wgsl"))) }
     }};
 }
 
@@ -307,8 +425,6 @@ struct Kernel {
     pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
     x: u32,
-    y: u32,
-    z: u32,
 }
 impl Kernel {
     fn new(
@@ -316,8 +432,6 @@ impl Kernel {
         (name, source): (&str, &str),
         buffers: &[&MetaBuffer],
         x: u32,
-        y: u32,
-        z: u32,
     ) -> Self {
         let (binding_entry_layouts, binding_entries): (Vec<_>, Vec<_>) = buffers
             .iter()
@@ -352,22 +466,74 @@ impl Kernel {
             pipeline,
             bind_group,
             x,
-            y,
-            z,
         }
     }
     fn dispatch<'s: 'c, 'c>(&'s self, pass: &mut wgpu::ComputePass<'c>) {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
-        pass.dispatch_workgroups(self.x, self.y, self.z);
+        pass.dispatch_workgroups(self.x, 0, 0);
+    }
+}
+
+struct TriGenState {
+    /// `vec3<i32>, f32`
+    chunk: MetaBuffer,
+    /// `[f32; 33^3 + 415]`
+    sdf_data: MetaBuffer,
+    /// `33^3 + 415`
+    sdf: Kernel,
+    /// [u32; 257]
+    //case_triangle_count: MetaBuffer,
+    /// `32^3`
+    triangle_allocation: Kernel,
+    /// [u32; 32^3 + 1]
+    triangle_count_prefix: MetaBuffer,
+    /// `256`
+    prefix_top: Kernel,
+    /// `[u32]`
+    //case_triangle_offset: MetaBuffer,
+    /// `[u32]`
+    //case_triangle_number: MetaBuffer,
+    /// `32^3`
+    triangle_writeback: Kernel,
+}
+impl TriGenState {
+    #[rustfmt::skip]
+    fn new(device: &wgpu::Device, cube_march: &CubeMarch, triangle_storage: &MetaBuffer) -> Self {
+        let chunk = MetaBuffer::new_uniform::<ChunkUniform>(device);
+        let sdf_data = MetaBuffer::new(device, "sdf_data", &vec![0.0_f32; 33*33*33 + 415]);
+        let triangle_count_prefix = MetaBuffer::new(device, "triangle_count_prefix", &vec![0_u32; 32*32*32 + 1]);
+
+
+        let sdf = Kernel::new(device, source!("sdf"), &[&chunk, &sdf_data], (33*33*33 + 415)/512);
+        let triangle_allocation = Kernel::new(device, source!("triangle_allocation"), &[&sdf_data, &triangle_count_prefix], (32*32*32)/128);
+        let prefix_top = Kernel::new(device, source!("prefix_top"), &[&triangle_count_prefix], 1);
+        let triangle_writeback = Kernel::new(device, source!("triangle_writeback"), &[&sdf_data, &triangle_count_prefix, &triangle_storage], 32*32*32/128);
+
+        Self { 
+            chunk, 
+            sdf_data, 
+            sdf, 
+            triangle_allocation, 
+            triangle_count_prefix, 
+            prefix_top,
+            triangle_writeback,
+        }
+
+    }
+    fn dispatch<'s: 'c, 'c>(&'s self, pass: &mut wgpu::ComputePass<'c>) {
+        self.sdf.dispatch(pass);
+        self.triangle_allocation.dispatch(pass);
+        self.prefix_top.dispatch(pass);
+        self.triangle_writeback.dispatch(pass);
     }
 }
 
 trait SearchExt<T: Copy + Eq> {
-    fn index(self, t: T) -> usize;
+    fn indexof(self, t: T) -> usize;
 }
 impl<T: Copy + Eq> SearchExt<T> for &[T] {
-    fn index(self, t: T) -> usize {
+    fn indexof(self, t: T) -> usize {
         for (i, v) in self.iter().copied().enumerate() {
             if t == v {
                 return i;
@@ -479,27 +645,31 @@ fn cube_march_cpu() -> Vec<[[f32; 3]; 3]> {
                 //         [px + x, py + y, pz + z].map(|e| e * (1.0 / size as f32))
                 //     }),
                 // );
-                tris.extend(cases[idx as usize].iter().copied().map(|tri| {
-                    tri.map(|i| {
-                        let [(sa, [ax, ay, az]), (sb, [bx, by, bz])] =
-                            EDGES[i].map(|vertex| (s[vertex], VERTS[vertex].map(|v| v as f32)));
-                        let sa = sa.abs();
-                        let sb = sb.abs();
-                        let sa = sa / (sa + sb);
-                        let sb = 1.0 - sa;
-                        let (sa, sb) = (2.0 * sb, 2.0 * sa);
-                        [sa * ax + sb * bx, sa * ay + sb * by, sa * az + sb * bz].map(|e| e * 0.5)
-                    })
-                    .map(|[px, py, pz]| {
-                        // println!("[{px}, {py}, {pz}]");
-                        [x + px, y + py, z + pz].map(|e| e / size as f32)
-                    })
-
-                    // tri.map(|[px, py, pz]| {
-                    //     // println!("[{px}, {py}, {pz}]");
-                    //     [x + px, y + py, z + pz].map(|e| e / size as f32)
-                    // })
-                }))
+                let count =
+                    cases.case_to_offset[idx as usize + 1] - cases.case_to_offset[idx as usize];
+                let offset = cases.case_to_offset[idx as usize];
+                tris.extend(
+                    (0..count)
+                        .map(|data_idx| {
+                            cases.triangle_to_edge[cases.offset_to_triangle[offset + data_idx]]
+                        })
+                        .map(|tri| {
+                            tri.map(|i| {
+                                let [(sa, [ax, ay, az]), (sb, [bx, by, bz])] =
+                                    cases.edge_to_corner[i].map(|vertex| {
+                                        (s[vertex], cases.corner_to_pos[vertex].map(|v| v as f32))
+                                    });
+                                let sa = sa.abs();
+                                let sb = sb.abs();
+                                let sa = sa / (sa + sb);
+                                let sb = 1.0 - sa;
+                                let (sa, sb) = (2.0 * sb, 2.0 * sa);
+                                [sa * ax + sb * bx, sa * ay + sb * by, sa * az + sb * bz]
+                                    .map(|e| e * 0.5)
+                            })
+                            .map(|[px, py, pz]| [x + px, y + py, z + pz].map(|e| e / size as f32))
+                        }),
+                )
             }
         }
     }
@@ -611,104 +781,279 @@ struct State<'a> {
     queue: wgpu::Queue,
     instance: wgpu::Instance,
     surface: wgpu::Surface<'a>,
+    surface_config: wgpu::SurfaceConfiguration,
+    render_pipeline: wgpu::RenderPipeline,
+    depth_texture: Texture,
+    camera_bind_group: wgpu::BindGroup,
+    camera: Camera,
+    vertex_buffer: wgpu::Buffer,
+    t0: Instant,
+    num_vert: u32,
+    camera_buffer: wgpu::Buffer,
+    last_time: Instant,
+    last_count: u32,
 }
 impl<'a> State<'a> {
     fn new(window: &'a winit::window::Window) -> Self {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            flags: wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER
+                | wgpu::InstanceFlags::DEBUG
+                | wgpu::InstanceFlags::VALIDATION,
+            dx12_shader_compiler: default(),
+            gles_minor_version: default(),
+        });
+        let adapters = instance.enumerate_adapters(wgpu::Backends::all());
+        eprintln!("--adapters:");
+        for adapter in &adapters {
+            dbg!(adapter.get_info());
+        }
+        eprintln!("--adapters");
 
-        todo!()
+        let surface: wgpu::Surface<'_> = instance.create_surface(window).unwrap();
+        let adapter = dbg!(adapters)
+            .into_iter()
+            .find(|a| dbg!(a).is_surface_supported(&surface))
+            .unwrap();
+        let surface_caps = dbg!(surface.get_capabilities(&adapter));
+        let surface_format = surface_caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| f.is_srgb())
+            .unwrap_or(surface_caps.formats[0]);
+        let surface_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: surface_format,
+            width: 200,
+            height: 200,
+            present_mode: wgpu::PresentMode::AutoNoVsync,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: dbg!(&surface_caps.alpha_modes)[0],
+            view_formats: vec![],
+        };
+
+        dbg!(adapter.limits());
+        dbg!(adapter.features());
+        dbg!(adapter.get_info());
+
+        let (device, queue) = match adapter.request_device(&default(), None).block_on() {
+            Ok(o) => o,
+            Err(e) => panic!("{}", e),
+        };
+        surface.configure(&device, &surface_config);
+
+        let shader_source = include_str!("shader.wgsl");
+
+        let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+        });
+
+        let vert: Vec<_> = cube_march_cpu().into_iter().flatten().collect(); // VERT;
+        let num_vert = vert.len() as u32;
+
+        let _ = indexify(&vert);
+
+        let vertex_buffer_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as _,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+        };
+
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&vert),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let t0 = Instant::now();
+        let last_time = Instant::now();
+        let last_count = 0;
+        let camera = Camera::new(&surface_config);
+
+        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&[CameraUniform::from_camera(&camera)]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let camera_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: None,
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &camera_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
+        });
+        let render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[&camera_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let depth_texture = Texture::new_depth(&device, &surface_config);
+
+
+        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: None,
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader_module,
+                entry_point: "vs_main",
+                buffers: &[vertex_buffer_layout],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: Texture::DEPTH_FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader_module,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview: None,
+        });
+
+        Self {
+            device,
+            queue,
+            instance,
+            surface,
+            render_pipeline,
+            depth_texture,
+            camera_bind_group,
+            camera,
+            surface_config,
+            vertex_buffer,
+            t0,
+            num_vert,
+            camera_buffer,
+            last_time,
+            last_count,
+        }
     }
-    fn render(&mut self) {}
-    fn resize(&mut self, width: u32, height: u32) {}
+    fn render(&mut self) {
+        let output = self.surface.get_current_texture().unwrap();
+        let view = &output.texture.create_view(&default());
+        let mut encoder = self.device.create_command_encoder(&default());
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // what to do with data from previous frame
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.1,
+                            g: 0.2,
+                            b: 0.3,
+                            a: 1.0,
+                        }),
+                        // if color result should be stored.
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_texture.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            render_pass.draw(0..self.num_vert, 0..1);
+        }
+        self.camera = Camera::new(&self.surface_config);
+        let t = self.t0.elapsed().as_secs_f32();
+        self.camera.eye = (
+            2.0 * t.sin(),
+            (t * 2.0_f32.sqrt() * 0.5).sin() * 0.1,
+            2.0 * t.cos(),
+        )
+            .into();
+        self.queue.write_buffer(
+            &self.camera_buffer,
+            0,
+            bytemuck::cast_slice(&[CameraUniform::from_camera(&self.camera)]),
+        );
+        self.queue.submit([encoder.finish()]);
+        output.present();
+        let elapsed = self.last_time.elapsed().as_secs_f64();
+        self.last_count += 1;
+        if elapsed > 1.0 {
+            let fps = self.last_count as f64 / elapsed;
+            println!("FPS: {fps}");
+
+            self.last_count = 0;
+            self.last_time = Instant::now();
+        }
+    }
+    fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
+        if size.width > 0 && size.height > 0 {
+            self.surface_config.width = size.width;
+            self.surface_config.height = size.height;
+            self.surface.configure(&self.device, &self.surface_config);
+            self.depth_texture = Texture::new_depth(&self.device, &self.surface_config);
+        }
+    }
 }
 
 fn main() {
     env_logger::init();
     std::env::set_var("RUST_BACKTRACE", "1");
     //cube_march_cpu();
+    println!("Do not forget `nix-shell`");
     let event_loop = EventLoop::new().unwrap();
     let window: winit::window::Window = WindowBuilder::new()
         .with_title("Marching Cubes")
         .build(&event_loop)
         .unwrap();
     let window = &window;
-
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::all(),
-        flags: wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER
-            | wgpu::InstanceFlags::DEBUG
-            | wgpu::InstanceFlags::VALIDATION,
-        dx12_shader_compiler: default(),
-        gles_minor_version: default(),
-    });
-    let adapters = instance.enumerate_adapters(wgpu::Backends::all());
-    eprintln!("--adapters:");
-    for adapter in &adapters {
-        dbg!(adapter.get_info());
-    }
-    eprintln!("--adapters");
-
-    // instance.request_adapter(&wgpu::RequestAdapterOptions {
-    //     power_preference: todo!(),
-    //     force_fallback_adapter: false,
-    //     compatible_surface: todo!(),
-    // });
-
-    let surface: wgpu::Surface<'_> = instance.create_surface(window).unwrap();
-    let adapter = dbg!(adapters)
-        .into_iter()
-        .find(|a| dbg!(a).is_surface_supported(&surface))
-        .unwrap();
-    let surface_caps = dbg!(surface.get_capabilities(&adapter));
-    let surface_format = surface_caps
-        .formats
-        .iter()
-        .copied()
-        .find(|f| f.is_srgb())
-        .unwrap_or(surface_caps.formats[0]);
-    let mut surface_config = wgpu::SurfaceConfiguration {
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        format: surface_format,
-        width: 200,
-        height: 200,
-        present_mode: wgpu::PresentMode::Immediate, //dbg!(&surface_caps.present_modes)[0],
-        desired_maximum_frame_latency: 2,
-        alpha_mode: dbg!(&surface_caps.alpha_modes)[0],
-        view_formats: vec![],
-    };
-
-    dbg!(adapter.limits());
-    dbg!(adapter.features());
-    dbg!(adapter.get_info());
-
-    let (device, queue) = match adapter.request_device(&default(), None).block_on() {
-        Ok(o) => o,
-        Err(e) => panic!("{}", e),
-    };
-
-    surface.configure(&device, &surface_config);
-
-    // device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-    //     label: None,
-    //     contents: todo!(),
-    //     usage: todo!(),
-    // });
-    // let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-    //     label: None,
-    //     layout: Some(&render_pipeline_layout),
-    //     vertex: todo!(),
-    //     primitive: todo!(),
-    //     depth_stencil: todo!(),
-    //     multisample: todo!(),
-    //     fragment: todo!(),
-    //     multiview: todo!(),
-    // });
-
-    let shader_source = include_str!("shader.wgsl");
-
-    let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: None,
-        source: wgpu::ShaderSource::Wgsl(shader_source.into()),
-    });
 
     const VERT: &[Vertex] = &[
         Vertex {
@@ -732,112 +1077,7 @@ fn main() {
     ];
 
     let vert = VERT;
-    let vert: Vec<_> = cube_march_cpu().into_iter().flatten().collect(); // VERT;
-    let num_vert = vert.len() as u32;
-
-    let _ = indexify(&vert);
-
-    let compact_vertex_buffer_layout = wgpu::VertexBufferLayout {
-        array_stride: std::mem::size_of::<Vertex>() as _,
-        step_mode: wgpu::VertexStepMode::Vertex,
-        attributes: &wgpu::vertex_attr_array![0 => Float32x3],
-    };
-
-    let vertex_buffer_layout = wgpu::VertexBufferLayout {
-        array_stride: std::mem::size_of::<Vertex>() as _,
-        step_mode: wgpu::VertexStepMode::Vertex,
-        attributes: &wgpu::vertex_attr_array![0 => Float32x3],
-    };
-
-    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: None,
-        contents: bytemuck::cast_slice(&vert),
-        usage: wgpu::BufferUsages::VERTEX,
-    });
-
-    let t0 = Instant::now();
-    let mut last_time = Instant::now();
-    let mut last_count = 0;
-    let mut camera = Camera::new(&surface_config);
-    let mut camera_uniform = CameraUniform::from_camera(&camera);
-
-    let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: None,
-        contents: bytemuck::cast_slice(&[camera_uniform]),
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-    });
-
-    let camera_bind_group_layout =
-        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-
-    let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None,
-        layout: &camera_bind_group_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: camera_buffer.as_entire_binding(),
-        }],
-    });
-    let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: None,
-        bind_group_layouts: &[&camera_bind_group_layout],
-        push_constant_ranges: &[],
-    });
-
-    let mut depth_texture = Texture::new_depth(&device, &surface_config);
-
-    let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: None,
-        layout: Some(&render_pipeline_layout),
-        vertex: wgpu::VertexState {
-            module: &shader_module,
-            entry_point: "vs_main",
-            buffers: &[vertex_buffer_layout],
-        },
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            strip_index_format: None,
-            front_face: wgpu::FrontFace::Ccw,
-            cull_mode: None,
-            unclipped_depth: false,
-            polygon_mode: wgpu::PolygonMode::Fill,
-            conservative: false,
-        },
-        depth_stencil: Some(wgpu::DepthStencilState {
-            format: Texture::DEPTH_FORMAT,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
-            stencil: wgpu::StencilState::default(),
-            bias: wgpu::DepthBiasState::default(),
-        }),
-        multisample: wgpu::MultisampleState {
-            count: 1,
-            mask: !0,
-            alpha_to_coverage_enabled: false,
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader_module,
-            entry_point: "fs_main",
-            targets: &[Some(wgpu::ColorTargetState {
-                format: surface_config.format,
-                blend: Some(wgpu::BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        multiview: None,
-    });
+    let mut state = State::new(window);
 
     event_loop
         .run(|event, window_target| match event {
@@ -849,67 +1089,11 @@ fn main() {
                             event: KeyEvent { logical_key: winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape), .. }, ..
                         } => window_target.exit(),
                         WindowEvent::RedrawRequested => {
-                            let output = surface.get_current_texture().unwrap();
-                            let view = &output.texture.create_view(&default());
-                            let mut encoder = device.create_command_encoder(&default());
-                            {
-                                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                    label: None,
-                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view,
-                                        resolve_target: None,
-                                        ops: wgpu::Operations {
-                                            // what to do with data from previous frame
-                                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                                r: 0.1,
-                                                g: 0.2,
-                                                b: 0.3,
-                                                a: 1.0,
-                                            }),
-                                            // if color result should be stored.
-                                            store: wgpu::StoreOp::Store,
-                                        },
-                                    })],
-                                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                                        view: &depth_texture.view,
-                                        depth_ops: Some(wgpu::Operations {
-                                            load: wgpu::LoadOp::Clear(1.0),
-                                            store: wgpu::StoreOp::Store
-                                        }),
-                                        stencil_ops: None,
-                                    }),
-                                    timestamp_writes: None,
-                                    occlusion_query_set: None,
-                                });
-                                render_pass.set_pipeline(&render_pipeline);
-                                render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-                                render_pass.set_bind_group(0, &camera_bind_group, &[]);
-                                render_pass.draw(0..num_vert, 0..1);
-                            }
-                            camera = Camera::new(&surface_config);
-                            let t = t0.elapsed().as_secs_f32();
-                            camera.eye = (2.0 * t.sin(), (t*2.0_f32.sqrt()*0.5).sin()*0.1, 2.0 * t.cos()).into();
-                            camera_uniform = CameraUniform::from_camera(&camera);
-                            queue.write_buffer(&camera_buffer, 0, bytemuck::cast_slice(&[camera_uniform]));
-                            queue.submit([encoder.finish()]);
-                            output.present();
+                            state.render();
                             window.request_redraw();
-                            let elapsed = last_time.elapsed().as_secs_f64();
-                            last_count += 1;
-                            if elapsed > 1.0 {
-                                let fps = last_count as f64 / elapsed;
-                                println!("FPS: {fps}");
-
-                                last_count = 0;
-                                last_time = Instant::now();
-                            }
                         }
                         WindowEvent::Resized(size) => {
-                            if size.width > 0 && size.height > 0 {
-                                surface_config.width = size.width;
-                                surface_config.height = size.height;
-                                surface.configure(&device, &surface_config);
-                                depth_texture = Texture::new_depth(&device, &surface_config);
-                            }
+                            state.resize(size);
                         }
                         _ => (),
                     }

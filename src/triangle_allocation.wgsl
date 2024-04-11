@@ -28,6 +28,7 @@ fn main(
 
     var idx = 0;
 
+    // TODO: sdf_data is 33^3
     idx |= u32(sdf_data[id]>0) << 0;
     idx |= u32(sdf_data[id+1]>0) << 1;
     idx |= u32(sdf_data[id+32]>0) << 2;
