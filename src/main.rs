@@ -1,21 +1,117 @@
 use std::{
     array,
     cmp::Eq,
-    collections::{HashMap, HashSet, VecDeque},
-    hash::Hash,
+    collections::{BTreeSet, HashMap, VecDeque},
+    fmt::Display,
     marker::Copy,
-    mem::{transmute, MaybeUninit},
-    ops::Index,
+    slice::from_ref,
     time::Instant,
 };
 
+// MSB                          LSB
+// 00000000000000000000000000000000
+//   ZZZZZZZZZZYYYYYYYYYYXXXXXXXXXX vertex % 3
+// 10 bit => 1024
+
+/*
+wgpu::DrawIndirectArgs {
+    vertex_count: 3,
+    instance_count: memcpy last offset,
+    first_vertex: 3 * pos,
+    first_instance: write_offset,
+}
+*/
+
+struct DataEntry {
+    offset: u32,
+    count: u32,
+    x: u32,
+    y: u32,
+    z: u32,
+}
+struct Storage {
+    // "copying" GC
+    // probably need 128 MiB.
+    b0: MetaBuffer,
+    //b1: MetaBuffer,
+    data: Vec<DataEntry>,
+    sorted: Vec<u32>, // closest at start.
+    in_queue: BTreeSet<(u32, u32, u32)>,
+    compute_queue: VecDeque<(u32, u32, u32)>,
+    count_staging_buffer: MetaBuffer,
+    send: std::sync::mpsc::Sender<Result<(), wgpu::BufferAsyncError>>,
+    recv: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    awaiting: Option<(u32, u32, u32)>,
+    offset: u32,
+}
+impl Storage {
+    fn new(device: &wgpu::Device, cube_march: &CubeMarch) -> Self {
+        todo!()
+    }
+    fn dispatch(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let target: (u32, u32, u32) = (0, 0, 0);
+        let radius = 10;
+
+        for x in target.0.saturating_sub(radius)..(target.0 + radius).min(1023) {
+            for y in target.1.saturating_sub(radius)..(target.1 + radius).min(1023) {
+                for z in target.2.saturating_sub(radius)..(target.2 + radius).min(1023) {
+                    if self.in_queue.insert((x, y, z)) {
+                        self.compute_queue.push_back((x, y, z));
+                    }
+                }
+            }
+        }
+
+        let Some((x, y, z)) = self.compute_queue.pop_front() else {
+            return;
+        };
+
+        if let Some((x, y, z)) = self.awaiting.take() {
+            let _: () = self.recv.recv().unwrap().unwrap();
+            let count = bytemuck::cast_slice::<u8, u32>(
+                &self
+                    .count_staging_buffer
+                    .buffer
+                    .slice(..)
+                    .get_mapped_range(),
+            )[0];
+            self.count_staging_buffer.buffer.unmap();
+            let entry = DataEntry {
+                offset: self.offset,
+                count,
+                x,
+                y,
+                z,
+            };
+            self.offset += count;
+            self.data.push(entry);
+        }
+
+        let chunk = ChunkUniform { x, y, z, offset: self.offset };
+
+        // dispatch here
+
+        self.awaiting = Some((x, y, z));
+        let sender = self.send.clone();
+        self.count_staging_buffer
+            .buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |x| sender.send(x).unwrap());
+    }
+    fn draw<'this, 'pass>(&'this mut self, pass: &'pass mut wgpu::RenderPass) where 'this: 'pass{
+        for &DataEntry { offset, count, x, y, z } in &self.data {
+            pass.draw(0..3, offset..(offset+count));
+        }
+    }
+}
+// Copying GC cycle:
+// 1. pause voxel creation
+// 2. copy all alive data to second buffer (crop sorted).
+// 3. swap buffers.
+
 use pollster::FutureExt;
 use wgpu::util::DeviceExt;
-use winit::{
-    event::*,
-    event_loop::{ControlFlow, EventLoop},
-    window::WindowBuilder,
-};
+use winit::{event::*, event_loop::EventLoop, window::WindowBuilder};
 
 fn default<T: Default>() -> T {
     Default::default()
@@ -28,234 +124,11 @@ struct Vertex {
 }
 
 // ... -(vertex shader)> triangle + index.
+mod marching_cubes;
+use marching_cubes::{cube_march_cpu, CubeMarch};
 
-fn gen_cases() -> Box<CubeMarch> {
-    const VERTS: [[i32; 3]; 8] = [
-        [-1, -1, -1],
-        [1, -1, -1],
-        [-1, 1, -1],
-        [1, 1, -1],
-        [-1, -1, 1],
-        [1, -1, 1],
-        [-1, 1, 1],
-        [1, 1, 1],
-    ];
-
-    const EDGES: [[usize; 2]; 12] = [
-        [0, 1],
-        [2, 3],
-        [4, 5],
-        [6, 7],
-        [0, 2],
-        [1, 3],
-        [4, 6],
-        [5, 7],
-        [0, 4],
-        [1, 5],
-        [2, 6],
-        [3, 7],
-    ];
-    //
-    //     .4------5
-    //   .' |    .'|
-    //  6---+--7'  |
-    //  |   |  |   |
-    //  |  .0--+---1
-    //  |.'    | .'
-    //  2------3'
-    //
-    //
-    //      z
-    //      |
-    //      |
-    //      |
-    //     .0------x
-    //   .'
-    //  y
-
-    fn make_transform(verts: &[[i32; 3]; 8], mtx: [[i32; 3]; 3]) -> [usize; 8] {
-        let v = VERTS.map(|v| {
-            let transformed = [
-                mtx[0][0] * v[0] + mtx[0][1] * v[1] + mtx[0][2] * v[2],
-                mtx[1][0] * v[0] + mtx[1][1] * v[1] + mtx[1][2] * v[2],
-                mtx[2][0] * v[0] + mtx[2][1] * v[1] + mtx[2][2] * v[2],
-            ];
-            verts.indexof(transformed)
-        });
-        v
-    }
-
-    let transforms = [
-        [[-1, 0, 0], [0, 1, 0], [0, 0, 1]],
-        [[1, 0, 0], [0, -1, 0], [0, 0, 1]],
-        [[1, 0, 0], [0, 1, 0], [0, 0, -1]],
-        [[1, 0, 0], [0, 0, -1], [0, 1, 0]],
-        [[0, 0, 1], [0, 1, 0], [-1, 0, 0]],
-        [[0, -1, 0], [1, 0, 0], [0, 0, 1]],
-    ]
-    .map(|m| make_transform(&VERTS, m));
-
-    let s01: usize = EDGES.indexof([0, 1]);
-    let s23: usize = EDGES.indexof([2, 3]);
-    let s45: usize = EDGES.indexof([4, 5]);
-    let s67: usize = EDGES.indexof([6, 7]);
-    let s02: usize = EDGES.indexof([0, 2]);
-    let s13: usize = EDGES.indexof([1, 3]);
-    let s46: usize = EDGES.indexof([4, 6]);
-    let s57: usize = EDGES.indexof([5, 7]);
-    let s04: usize = EDGES.indexof([0, 4]);
-    let s15: usize = EDGES.indexof([1, 5]);
-    let s26: usize = EDGES.indexof([2, 6]);
-    let s37: usize = EDGES.indexof([3, 7]);
-
-    let t0: usize = 1 << 0;
-    let t1: usize = 1 << 1;
-    let t2: usize = 1 << 2;
-    let t3: usize = 1 << 3;
-    let t4: usize = 1 << 4;
-    let t5: usize = 1 << 5;
-    let t6: usize = 1 << 6;
-    let t7: usize = 1 << 7;
-    // https://upload.wikimedia.org/wikipedia/commons/thumb/8/8b/MarchingCubesEdit.svg/525px-MarchingCubesEdit.svg.png
-    //     .4------5
-    //   .' |    .'|
-    //  6---+--7'  |
-    //  |   |  |   |
-    //  |  .0--+---1
-    //  |.'    | .'
-    //  2------3'
-    //
-
-    // created manually from the cases presented on wikipedia
-    #[rustfmt::skip]
-    let cases = [
-        (0, vec![]),
-        (t2, vec![[s02, s23, s26]]),
-        (t2|t3, vec![[s02, s13, s26], [s26, s37, s13]]),
-        (t2|t7, vec![[s02, s23, s26], [s67, s57, s37]]),
-        (t0|t1|t3, vec![[s02, s23, s37], [s02, s04, s37], [s04, s15, s37]]),
-        // ----
-        (t0|t1|t2|t3, vec![[s04, s15, s26], [s15, s37, s26]]),
-        (t6|t0|t1|t3, vec![[s46, s67, s26], [s04, s15, s37], [s37, s04, s02], [s23, s37, s02]]),
-        (t4|t7|t2|t1, vec![[s02, s23, s26], [s46, s45, s04], [s67, s57, s37], [s01, s13, s15]]),
-        (t4|t1|t0|t2, vec![[s45, s46, s26], [s26, s45, s23], [s45, s15, s23], [s15, s13, s23]]),
-        (t4|t0|t1|t3, vec![[s45, s15, s46], [s46, s15, s23], [s46, s23, s02], [s23, s15, s37]]),
-        // ----
-        (t2|t5, vec![[s45, s15, s57], [s02, s23, s26]]),
-        (t2|t3|t5, vec![[s45, s15, s57], [s02, s13, s26], [s13, s26, s37]]),
-        (t6|t5|t3, vec![[s46, s67, s26], [s15, s57, s45], [s37, s13, s23]]),
-        (t2|t6|t1|t5, vec![[s46, s02, s23], [s46, s67, s23], [s45, s57, s13], [s01, s13, s45]]),
-        (t1|t5|t2|t0, vec![[s45, s57, s04], [s26, s23, s04], [s04, s57, s23], [s13, s23, s57]]),
-    ];
-    let mut front: VecDeque<_> = cases.into_iter().collect();
-
-    let mut found: [_; 256] = std::array::from_fn(|_| None);
-
-    while let Some((i, c)) = front.pop_front() {
-        for transform in transforms {
-            let mut j = 0;
-            for bit in 0..8 {
-                let mask = 1 << bit;
-                if i & mask != 0 {
-                    j |= 1 << transform[bit];
-                }
-            }
-            for j in [j, j ^ 255] {
-                if found[j].is_some() || i == j {
-                    continue;
-                }
-                let c: Vec<_> = c
-                    .iter()
-                    .map(|tri| {
-                        tri.map(|edge_vertex| {
-                            let mut transformed =
-                                EDGES[edge_vertex].map(|vertex| transform[vertex]);
-                            transformed.sort();
-                            EDGES.indexof(transformed)
-                        })
-                    })
-                    .collect();
-                front.push_back((j, c));
-            }
-        }
-        found[i] = Some(c);
-    }
-    // let found: [Vec<_>; 256] = found.map(|f| {
-    //     f.unwrap()
-    //         .into_iter()
-    //         .map(|v| {
-    //             v.map(|i| {
-    //                 let [[ax, ay, az], [bx, by, bz]] = EDGES[i].map(|s| VERTS[s].map(|v| v as f32));
-    //                 [ax + bx, ay + by, az + bz].map(|e| e * 0.5)
-    //             })
-    //         })
-    //         .collect()
-    // });
-    let found = found.map(|f| {
-        let mut f = f.unwrap();
-        f.iter_mut().for_each(|f| f.sort());
-        f
-    });
-    println!("{:?}", &found);
-    println!("{:?}", found.clone().map(|f| f.len()));
-    let flattened: Vec<_> = found.iter().cloned().flatten().collect();
-    println!("{:?}", &flattened);
-    println!("{:?}", flattened.len());
-    let triangle_to_edge = {
-        let mut f: Vec<_> = found.iter().flatten().copied().collect();
-        f.sort();
-        f.dedup();
-        collect_arr(f.into_iter())
-    };
-    let found = found.map(|f| {
-        f.into_iter()
-            .map(|f| triangle_to_edge.indexof(f))
-            .collect::<Vec<_>>()
-    });
-
-    let mut prefix = 0;
-
-    let case_to_offset = array::from_fn(|i| {
-        prefix += found.get(i.wrapping_sub(1)).map(|i| i.len()).unwrap_or(0);
-        prefix
-    });
-    let case_to_size = array::from_fn(|i| found[i].len());
-    // 732 135
-    let offset_to_triangle = collect_arr(found.iter().flat_map(|v| v.iter()).copied());
-    // 732 135
-    //panic!("{} {}", offset_to_triangle.len(), triangle_to_edge.len());
-    Box::new(CubeMarch {
-        case_to_offset,
-        offset_to_triangle,
-        triangle_to_edge,
-        edge_to_corner: EDGES,
-        corner_to_pos: VERTS,
-        case_to_size,
-    })
-}
-
-fn collect_arr<const N: usize, T>(mut i: impl Iterator<Item = T>) -> [T; N] {
-    let arr = std::array::from_fn(|_| i.next().unwrap());
-    assert!(i.next().is_none());
-    arr
-}
-
-/// All the LUTs for cube maching
-/// The uniforms denormalize this.
-struct CubeMarch {
-    // case -> size
-    case_to_size: [usize; 256],
-    // case -> offset
-    case_to_offset: [usize; 257],
-    // offsets -> triangle
-    offset_to_triangle: [usize; 732],
-    // triangle -> 3*edge.
-    triangle_to_edge: [[usize; 3]; 135],
-    // edge -> 2*vertex.
-    edge_to_corner: [[usize; 2]; 12],
-    // vertex -> normalized position.
-    corner_to_pos: [[i32; 3]; 8],
-}
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
 struct TriAllocUniform {
     // 3 bit (0..=4)
     case_to_size: [u32; 256],
@@ -267,12 +140,15 @@ impl TriAllocUniform {
         }
     }
 }
+unsafe impl bytemuck::NoUninit for TriWriteBackUniform {}
+#[derive(Copy, Clone)]
+#[repr(C)]
 struct TriWriteBackUniform {
     /// triangle lives on 3 edges
     /// each edge is on 2 corners
     /// edge0 edge1, edge2
     /// XYZ XYZ XYZ XYZ XYZ XYZ TRIA = 22 significant bits
-    offset_to_corners_and_triangle: [u32; 732],
+    offset_to_bitpack: [u32; 732],
     /// 10 bit (0..732)
     case_to_offset: [u32; 257],
     /// Padding
@@ -285,13 +161,14 @@ struct TriWriteBackUniform {
 impl TriWriteBackUniform {
     fn new(case: &CubeMarch) -> Self {
         Self {
-            offset_to_corners_and_triangle: case.offset_to_triangle.map(|triangle| {
+            offset_to_bitpack: case.offset_to_triangle.map(|triangle| {
                 let [a, b, c] = case.triangle_to_edge[triangle].map(|edge| {
                     let [a, b] = case.edge_to_corner[edge];
                     (a as u32) | ((b as u32) << 3)
                 });
                 let triangle = triangle as u32;
-                a | (b << 6) | (c << 12) | (triangle << 18)
+                // a | (b << 6) | (c << 12) | (triangle << 18)
+                triangle | (a << 8) | (b << 14) | (c << 20)
             }),
             case_to_offset: case.case_to_offset.map(|offset| offset as u32),
             _unused0: 0,
@@ -300,6 +177,9 @@ impl TriWriteBackUniform {
         }
     }
 }
+unsafe impl bytemuck::NoUninit for RenderCaseUniform {}
+#[derive(Copy, Clone)]
+#[repr(C)]
 struct RenderCaseUniform {
     /// XYZ XYZ XYZ XYZ XYZ XYZ = 18 bit
     triangle_to_corners: [u32; 135],
@@ -321,45 +201,72 @@ impl RenderCaseUniform {
     }
 }
 
-struct CubeMarchUniform {}
-
 struct MetaBuffer {
     buffer: wgpu::Buffer,
     bytes: u64,
     ty: wgpu::BufferBindingType,
 }
 impl MetaBuffer {
-    fn new<T: bytemuck::NoUninit>(device: &wgpu::Device, name: &str, contents: &[T]) -> Self {
+    fn new<T: bytemuck::NoUninit>(
+        device: &wgpu::Device,
+        name: &str,
+        flags: wgpu::BufferUsages,
+        contents: &[T],
+    ) -> Self {
         Self::new_i(
             device,
             name,
             wgpu::BufferBindingType::Storage { read_only: false },
-            wgpu::BufferUsages::STORAGE,
+            wgpu::BufferUsages::STORAGE | flags,
             bytemuck::cast_slice(contents),
         )
     }
     fn new_constant<T: bytemuck::NoUninit>(
         device: &wgpu::Device,
         name: &str,
+        flags: wgpu::BufferUsages,
         contents: &[T],
     ) -> Self {
         Self::new_i(
             device,
             name,
             wgpu::BufferBindingType::Storage { read_only: true },
-            wgpu::BufferUsages::STORAGE,
+            wgpu::BufferUsages::STORAGE | flags,
             bytemuck::cast_slice(contents),
         )
     }
-    fn new_uniform<T: Default + bytemuck::NoUninit>(device: &wgpu::Device) -> Self {
-        let data = T::default();
+    fn new_uniform<T: bytemuck::NoUninit>(
+        device: &wgpu::Device,
+        flags: wgpu::BufferUsages,
+        data: &T,
+    ) -> Self {
         Self::new_i(
             device,
             &format!("{} uniform buffer", std::any::type_name::<T>()),
             wgpu::BufferBindingType::Uniform,
-            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            bytemuck::cast_slice(&[data]),
+            // wgpu::BufferUsages::COPY_DST
+            wgpu::BufferUsages::UNIFORM | flags,
+            bytemuck::cast_slice(from_ref(data)),
         )
+    }
+    fn new_uninit(
+        device: &wgpu::Device,
+        name: &str,
+        flags: wgpu::BufferUsages,
+        bytes: u64,
+    ) -> Self {
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(name),
+            size: bytes,
+            usage: flags,
+            mapped_at_creation: false,
+        });
+
+        Self {
+            buffer,
+            bytes,
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+        }
     }
     fn new_i(
         device: &wgpu::Device,
@@ -382,7 +289,7 @@ impl MetaBuffer {
     fn binding_layout(&self, binding: u32) -> wgpu::BindGroupLayoutEntry {
         wgpu::BindGroupLayoutEntry {
             binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
+            visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::VERTEX,
             ty: wgpu::BindingType::Buffer {
                 ty: self.ty,
                 has_dynamic_offset: false,
@@ -405,10 +312,10 @@ impl MetaBuffer {
 #[derive(Default, Copy, Clone, bytemuck::NoUninit)]
 #[repr(C)]
 struct ChunkUniform {
-    x: i32,
-    y: i32,
-    z: i32,
-    write_offset: u32,
+    x: u32,
+    y: u32,
+    z: u32,
+    offset: u32,
 }
 
 #[rustfmt::skip]
@@ -471,9 +378,21 @@ impl Kernel {
     fn dispatch<'s: 'c, 'c>(&'s self, pass: &mut wgpu::ComputePass<'c>) {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
-        pass.dispatch_workgroups(self.x, 0, 0);
+        pass.dispatch_workgroups(self.x, 1, 1);
     }
 }
+
+const NONE: wgpu::BufferUsages = wgpu::BufferUsages::empty();
+const MAP_READ: wgpu::BufferUsages = wgpu::BufferUsages::MAP_READ;
+const MAP_WRITE: wgpu::BufferUsages = wgpu::BufferUsages::MAP_WRITE;
+const COPY_SRC: wgpu::BufferUsages = wgpu::BufferUsages::COPY_SRC;
+const COPY_DST: wgpu::BufferUsages = wgpu::BufferUsages::COPY_DST;
+const INDEX: wgpu::BufferUsages = wgpu::BufferUsages::INDEX;
+const VERTEX: wgpu::BufferUsages = wgpu::BufferUsages::VERTEX;
+const UNIFORM: wgpu::BufferUsages = wgpu::BufferUsages::UNIFORM;
+const STORAGE: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE;
+const INDIRECT: wgpu::BufferUsages = wgpu::BufferUsages::INDIRECT;
+const QUERY_RESOLVE: wgpu::BufferUsages = wgpu::BufferUsages::QUERY_RESOLVE;
 
 struct TriGenState {
     /// `vec3<i32>, f32`
@@ -496,50 +415,142 @@ struct TriGenState {
     //case_triangle_number: MetaBuffer,
     /// `32^3`
     triangle_writeback: Kernel,
+    triangle_count_buffer: MetaBuffer,
+    render_case_uniform: MetaBuffer,
+    // query_buffer0: MetaBuffer,
+    // query_buffer1: MetaBuffer,
 }
 impl TriGenState {
     #[rustfmt::skip]
     fn new(device: &wgpu::Device, cube_march: &CubeMarch, triangle_storage: &MetaBuffer) -> Self {
-        let chunk = MetaBuffer::new_uniform::<ChunkUniform>(device);
-        let sdf_data = MetaBuffer::new(device, "sdf_data", &vec![0.0_f32; 33*33*33 + 415]);
-        let triangle_count_prefix = MetaBuffer::new(device, "triangle_count_prefix", &vec![0_u32; 32*32*32 + 1]);
+        let sdf_data = MetaBuffer::new(device, "sdf_data", NONE, &vec![0.0_f32; 33*33*33 + 159]);
+
+        let triangle_count_prefix = MetaBuffer::new(device, "triangle_count_prefix", COPY_SRC, &vec![0_u32; 32*32*32 + 1]);
+
+        let triangle_count_buffer = MetaBuffer::new_uninit(device, "tri count buffer", COPY_DST | MAP_READ, std::mem::size_of::<u32>() as u64);
+
+        // let query_buffer0 = MetaBuffer::new_uninit(device, "query buffer0", COPY_SRC | QUERY_RESOLVE, (std::mem::size_of::<u64>() * 2) as u64);
+        // let query_buffer1 = MetaBuffer::new_uninit(device, "query buffer1", COPY_DST | MAP_READ, (std::mem::size_of::<u64>() * 2) as u64);
+
+        let render_case_uniform = RenderCaseUniform::new(&cube_march);
+        let render_case_uniform = MetaBuffer::new(device, "render_case_uniform", NONE, from_ref(&render_case_uniform));
 
 
-        let sdf = Kernel::new(device, source!("sdf"), &[&chunk, &sdf_data], (33*33*33 + 415)/512);
-        let triangle_allocation = Kernel::new(device, source!("triangle_allocation"), &[&sdf_data, &triangle_count_prefix], (32*32*32)/128);
+        let chunk_uniform = ChunkUniform::default();
+        let chunk_uniform = MetaBuffer::new_uniform(device, COPY_DST, &chunk_uniform);
+
+        let tri_alloc_uniform = TriAllocUniform::new(&cube_march);
+        let tri_alloc_uniform = MetaBuffer::new_constant(device, "TriAllocUniform", NONE, from_ref(&tri_alloc_uniform));
+
+        let tri_wb_uniform = TriWriteBackUniform::new(&cube_march);
+        let tri_wb_uniform = MetaBuffer::new_constant(device, "TriWriteBackUniform", NONE, from_ref(&tri_wb_uniform));
+
+        let sdf = Kernel::new(device, source!("sdf"), &[&chunk_uniform, &sdf_data], (33*33*33 + 159)/256);
+        let triangle_allocation = Kernel::new(device, source!("triangle_allocation"), &[&tri_alloc_uniform, &sdf_data, &triangle_count_prefix], (32*32*32)/128);
         let prefix_top = Kernel::new(device, source!("prefix_top"), &[&triangle_count_prefix], 1);
-        let triangle_writeback = Kernel::new(device, source!("triangle_writeback"), &[&sdf_data, &triangle_count_prefix, &triangle_storage], 32*32*32/128);
+        let triangle_writeback = Kernel::new(device, source!("triangle_writeback"), &[&sdf_data, &triangle_count_prefix, &triangle_storage, &tri_wb_uniform, &chunk_uniform], 32*32*32/128);
 
-        Self { 
-            chunk, 
-            sdf_data, 
-            sdf, 
-            triangle_allocation, 
-            triangle_count_prefix, 
+        Self {
+            chunk: chunk_uniform,
+            sdf_data,
+            sdf,
+            triangle_allocation,
+            triangle_count_prefix,
             prefix_top,
             triangle_writeback,
+            triangle_count_buffer,
+            render_case_uniform,
+            // query_buffer0,
+            // query_buffer1,
         }
 
     }
-    fn dispatch<'s: 'c, 'c>(&'s self, pass: &mut wgpu::ComputePass<'c>) {
-        self.sdf.dispatch(pass);
-        self.triangle_allocation.dispatch(pass);
-        self.prefix_top.dispatch(pass);
-        self.triangle_writeback.dispatch(pass);
-    }
-}
+    fn dispatch<'s: 'c, 'c>(
+        &'s self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue, /*, qset: &wgpu::QuerySet*/
+    ) -> u32 {
+        let mut encoder = device.create_command_encoder(&default());
+        //encoder.write_timestamp(qset, 0);
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        self.sdf.dispatch(&mut pass);
+        self.triangle_allocation.dispatch(&mut pass);
+        self.prefix_top.dispatch(&mut pass);
+        self.triangle_writeback.dispatch(&mut pass);
+        drop(pass);
 
-trait SearchExt<T: Copy + Eq> {
-    fn indexof(self, t: T) -> usize;
-}
-impl<T: Copy + Eq> SearchExt<T> for &[T] {
-    fn indexof(self, t: T) -> usize {
-        for (i, v) in self.iter().copied().enumerate() {
-            if t == v {
-                return i;
-            }
-        }
-        panic!()
+        //encoder.write_timestamp(qset, 1);
+
+        encoder.copy_buffer_to_buffer(
+            &self.triangle_count_prefix.buffer,
+            (32 * 32 * 32) * 4,
+            &self.triangle_count_buffer.buffer,
+            0,
+            4,
+        );
+        //encoder.resolve_query_set(&qset, 0..2, &self.query_buffer0.buffer, 0);
+        //encoder.copy_buffer_to_buffer(&self.query_buffer0.buffer, 0, &self.query_buffer1.buffer, 0, 2 * std::mem::size_of::<u64>() as u64);
+        queue.submit([encoder.finish()]);
+        //self.query_buffer1.buffer.slice(..).map_async(wgpu::MapMode::Read, |x| x.unwrap());
+        self.triangle_count_buffer
+            .buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, |x| x.unwrap());
+        device.poll(wgpu::Maintain::Wait);
+        let tmp = self
+            .triangle_count_buffer
+            .buffer
+            .slice(..)
+            .get_mapped_range();
+        let data: &[u32] = bytemuck::cast_slice(&tmp);
+        //println!("Expected triangles written: {}.", data[0]);
+        let num_tris = data[0];
+        drop(tmp);
+        self.triangle_count_buffer.buffer.unmap();
+
+        //let tmp2 = self.query_buffer1.buffer.slice(..).get_mapped_range();
+        //let data2: &[u64] = bytemuck::cast_slice(&tmp2);
+
+        // let start = data2[0];
+        // let end = data2[1];
+
+        // let dur = std::time::Duration::from_secs_f64(((end - start) as f64 * queue.get_timestamp_period() as f64)*(1.0/1_000_000_000.0));
+
+        // panic!("{dur:?}");
+
+        num_tris
+    }
+    fn inspect(&self, triangle_storage: &MetaBuffer, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let read_buf = triangle_storage;
+
+        let bytes = 3000 * 4;
+
+        let tmp_buf = MetaBuffer::new_uninit(device, "tmp dst", MAP_READ | COPY_DST, bytes);
+
+        let mut encoder = device.create_command_encoder(&default());
+
+        encoder.copy_buffer_to_buffer(&read_buf.buffer, 0, &tmp_buf.buffer, 0, bytes);
+        queue.submit([encoder.finish()]);
+
+        tmp_buf
+            .buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, |_| ());
+        device.poll(wgpu::Maintain::Wait);
+
+        let slice: &[u8] = &tmp_buf.buffer.slice(..).get_mapped_range();
+
+        let slice_u32: &[u32] = bytemuck::cast_slice(slice);
+        println!("{slice_u32:?}");
+
+        // let diff = slice_u32.windows(2).map(|w| w[1] - w[0]).collect::<Vec<_>>();
+        // println!("{diff:?}");
+        // for c in slice_u32[1..].chunks(128) {
+        //     println!("{:?}", c.last());
+        // }
     }
 }
 
@@ -554,10 +565,9 @@ fn cmap<U: Copy, V: Copy, const N: usize>(a: [U; N], f: fn(U) -> V, v_default: V
     }
     output
 }
-// plan:
 // gen u8 from sdf, calc number of verts per cell.
 // prefix sum verts per cell
-// draw the sum of verts of vertices?
+// draw the sum of verts of vertices
 //
 //
 // passes:
@@ -586,95 +596,6 @@ fn indexify(v: &[[f32; 3]]) -> (Vec<[f32; 3]>, Vec<u32>) {
     }
 
     (data, idxs)
-}
-
-fn cube_march_cpu() -> Vec<[[f32; 3]; 3]> {
-    fn sdf(x: usize, y: usize, z: usize) -> f32 {
-        let x = (x as f32 / 2.0) % 30.0 - 15.0;
-        let y = (y as f32 / 2.0) % 30.0 - 15.0;
-        let z = (z as f32 / 2.0) % 30.0 - 15.0;
-
-        (x * x + y * y + z * z).sqrt() - 10.0
-    }
-
-    let cases = gen_cases();
-
-    let mut tris: Vec<[[f32; 3]; 3]> = Vec::new();
-
-    let size = 32;
-
-    for x in 0..size {
-        for y in 0..size {
-            for z in 0..size {
-                let mut idx = 0;
-                //     .4------5
-                //   .' |    .'|
-                //  6---+--7'  |
-                //  |   |  |   |
-                //  |  .0--+---1
-                //  |.'    | .'
-                //  2------3'
-                //
-                //      z
-                //      |
-                //      |
-                //      |
-                //     .0------x
-                //   .'
-                //  y
-                let scale = size as f32;
-                let s = [
-                    sdf(x + 0, y + 0, z + 0).clamp(-0.5, 0.5),
-                    sdf(x + 1, y + 0, z + 0).clamp(-0.5, 0.5),
-                    sdf(x + 0, y + 1, z + 0).clamp(-0.5, 0.5),
-                    sdf(x + 1, y + 1, z + 0).clamp(-0.5, 0.5),
-                    sdf(x + 0, y + 0, z + 1).clamp(-0.5, 0.5),
-                    sdf(x + 1, y + 0, z + 1).clamp(-0.5, 0.5),
-                    sdf(x + 0, y + 1, z + 1).clamp(-0.5, 0.5),
-                    sdf(x + 1, y + 1, z + 1).clamp(-0.5, 0.5),
-                ];
-                for (i, &s) in s.iter().enumerate() {
-                    idx |= ((s > 0.0) as u8) << i;
-                }
-
-                let x = (x as f32) * 2.0 - (size - 1) as f32;
-                let y = (y as f32) * 2.0 - (size - 1) as f32;
-                let z = (z as f32) * 2.0 - (size - 1) as f32;
-                // tris.push(
-                //     [[0.0, 1.0, 0.0], [-1.0, -1.0, 0.0], [1.0, -1.0, 0.0]].map(|[px, py, pz]| {
-                //         [px + x, py + y, pz + z].map(|e| e * (1.0 / size as f32))
-                //     }),
-                // );
-                let count =
-                    cases.case_to_offset[idx as usize + 1] - cases.case_to_offset[idx as usize];
-                let offset = cases.case_to_offset[idx as usize];
-                tris.extend(
-                    (0..count)
-                        .map(|data_idx| {
-                            cases.triangle_to_edge[cases.offset_to_triangle[offset + data_idx]]
-                        })
-                        .map(|tri| {
-                            tri.map(|i| {
-                                let [(sa, [ax, ay, az]), (sb, [bx, by, bz])] =
-                                    cases.edge_to_corner[i].map(|vertex| {
-                                        (s[vertex], cases.corner_to_pos[vertex].map(|v| v as f32))
-                                    });
-                                let sa = sa.abs();
-                                let sb = sb.abs();
-                                let sa = sa / (sa + sb);
-                                let sb = 1.0 - sa;
-                                let (sa, sb) = (2.0 * sb, 2.0 * sa);
-                                [sa * ax + sb * bx, sa * ay + sb * by, sa * az + sb * bz]
-                                    .map(|e| e * 0.5)
-                            })
-                            .map(|[px, py, pz]| [x + px, y + py, z + pz].map(|e| e / size as f32))
-                        }),
-                )
-            }
-        }
-    }
-    dbg!(tris.len());
-    tris
 }
 
 #[repr(C)]
@@ -776,6 +697,134 @@ impl Texture {
     }
 }
 
+#[derive(Debug)]
+struct HumanSize<T>(T);
+impl<T: Into<u64> + Copy> Display for HumanSize<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n: u64 = self.0.into();
+
+        if n < 1024 {
+            write!(f, "{} B", n)
+        } else if n < 1024 * 1024 {
+            write!(f, "{} KiB", n / 1024)
+        } else if n < 1024 * 1024 * 1024 {
+            write!(f, "{} MiB", n / 1024 / 1024)
+        } else {
+            write!(f, "{} GiB", n / 1024 / 1024 / 1024)
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LimitsCmp {
+    max_texture_dimension_1d: [u32; 2],
+    max_texture_dimension_2d: [u32; 2],
+    max_texture_dimension_3d: [u32; 2],
+    max_texture_array_layers: [u32; 2],
+    max_bind_groups: [u32; 2],
+    max_bindings_per_bind_group: [u32; 2],
+    max_dynamic_uniform_buffers_per_pipeline_layout: [u32; 2],
+    max_dynamic_storage_buffers_per_pipeline_layout: [u32; 2],
+    max_sampled_textures_per_shader_stage: [u32; 2],
+    max_samplers_per_shader_stage: [u32; 2],
+    max_storage_buffers_per_shader_stage: [u32; 2],
+    max_storage_textures_per_shader_stage: [u32; 2],
+    max_uniform_buffers_per_shader_stage: [u32; 2],
+    max_uniform_buffer_binding_size: [HumanSize<u32>; 2],
+    max_storage_buffer_binding_size: [HumanSize<u32>; 2],
+    max_vertex_buffers: [u32; 2],
+    max_buffer_size: [HumanSize<u64>; 2],
+    max_vertex_attributes: [u32; 2],
+    max_vertex_buffer_array_stride: [u32; 2],
+    min_uniform_buffer_offset_alignment: [u32; 2],
+    min_storage_buffer_offset_alignment: [u32; 2],
+    max_inter_stage_shader_components: [u32; 2],
+    max_compute_workgroup_storage_size: [HumanSize<u32>; 2],
+    max_compute_invocations_per_workgroup: [u32; 2],
+    max_compute_workgroup_size_x: [u32; 2],
+    max_compute_workgroup_size_y: [u32; 2],
+    max_compute_workgroup_size_z: [u32; 2],
+    max_compute_workgroups_per_dimension: [u32; 2],
+    max_push_constant_size: [u32; 2],
+    max_non_sampler_bindings: [u32; 2],
+}
+impl Display for LimitsCmp {
+    #[rustfmt::skip]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "LimitsCmp {{")?;
+        writeln!(f, "max_texture_dimension_1d: {}, {}", self.max_texture_dimension_1d[0], self.max_texture_dimension_1d[1])?;
+        writeln!(f, "max_texture_dimension_2d: {}, {}", self.max_texture_dimension_2d[0], self.max_texture_dimension_2d[1])?;
+        writeln!(f, "max_texture_dimension_3d: {}, {}", self.max_texture_dimension_3d[0], self.max_texture_dimension_3d[1])?;
+        writeln!(f, "max_texture_array_layers: {}, {}", self.max_texture_array_layers[0], self.max_texture_array_layers[1])?;
+        writeln!(f, "max_bind_groups: {}, {}", self.max_bind_groups[0], self.max_bind_groups[1])?;
+        writeln!(f, "max_bindings_per_bind_group: {}, {}", self.max_bindings_per_bind_group[0], self.max_bindings_per_bind_group[1])?;
+        writeln!(f, "max_dynamic_uniform_buffers_per_pipeline_layout: {}, {}", self.max_dynamic_uniform_buffers_per_pipeline_layout[0], self.max_dynamic_uniform_buffers_per_pipeline_layout[1])?;
+        writeln!(f, "max_dynamic_storage_buffers_per_pipeline_layout: {}, {}", self.max_dynamic_storage_buffers_per_pipeline_layout[0], self.max_dynamic_storage_buffers_per_pipeline_layout[1])?;
+        writeln!(f, "max_sampled_textures_per_shader_stage: {}, {}", self.max_sampled_textures_per_shader_stage[0], self.max_sampled_textures_per_shader_stage[1])?;
+        writeln!(f, "max_samplers_per_shader_stage: {}, {}", self.max_samplers_per_shader_stage[0], self.max_samplers_per_shader_stage[1])?;
+        writeln!(f, "max_storage_buffers_per_shader_stage: {}, {}", self.max_storage_buffers_per_shader_stage[0], self.max_storage_buffers_per_shader_stage[1])?;
+        writeln!(f, "max_storage_textures_per_shader_stage: {}, {}", self.max_storage_textures_per_shader_stage[0], self.max_storage_textures_per_shader_stage[1])?;
+        writeln!(f, "max_uniform_buffers_per_shader_stage: {}, {}", self.max_uniform_buffers_per_shader_stage[0], self.max_uniform_buffers_per_shader_stage[1])?;
+        writeln!(f, "max_uniform_buffer_binding_size: {}, {}", self.max_uniform_buffer_binding_size[0], self.max_uniform_buffer_binding_size[1])?;
+        writeln!(f, "max_storage_buffer_binding_size: {}, {}", self.max_storage_buffer_binding_size[0], self.max_storage_buffer_binding_size[1])?;
+        writeln!(f, "max_vertex_buffers: {}, {}", self.max_vertex_buffers[0], self.max_vertex_buffers[1])?;
+        writeln!(f, "max_buffer_size: {}, {}", self.max_buffer_size[0], self.max_buffer_size[1])?;
+        writeln!(f, "max_vertex_attributes: {}, {}", self.max_vertex_attributes[0], self.max_vertex_attributes[1])?;
+        writeln!(f, "max_vertex_buffer_array_stride: {}, {}", self.max_vertex_buffer_array_stride[0], self.max_vertex_buffer_array_stride[1])?;
+        writeln!(f, "min_uniform_buffer_offset_alignment: {}, {}", self.min_uniform_buffer_offset_alignment[0], self.min_uniform_buffer_offset_alignment[1])?;
+        writeln!(f, "min_storage_buffer_offset_alignment: {}, {}", self.min_storage_buffer_offset_alignment[0], self.min_storage_buffer_offset_alignment[1])?;
+        writeln!(f, "max_inter_stage_shader_components: {}, {}", self.max_inter_stage_shader_components[0], self.max_inter_stage_shader_components[1])?;
+        writeln!(f, "max_compute_workgroup_storage_size: {}, {}", self.max_compute_workgroup_storage_size[0], self.max_compute_workgroup_storage_size[1])?;
+        writeln!(f, "max_compute_invocations_per_workgroup: {}, {}", self.max_compute_invocations_per_workgroup[0], self.max_compute_invocations_per_workgroup[1])?;
+        writeln!(f, "max_compute_workgroup_size_x: {}, {}", self.max_compute_workgroup_size_x[0], self.max_compute_workgroup_size_x[1])?;
+        writeln!(f, "max_compute_workgroup_size_y: {}, {}", self.max_compute_workgroup_size_y[0], self.max_compute_workgroup_size_y[1])?;
+        writeln!(f, "max_compute_workgroup_size_z: {}, {}", self.max_compute_workgroup_size_z[0], self.max_compute_workgroup_size_z[1])?;
+        writeln!(f, "max_compute_workgroups_per_dimension: {}, {}", self.max_compute_workgroups_per_dimension[0], self.max_compute_workgroups_per_dimension[1])?;
+        writeln!(f, "max_push_constant_size: {}, {}", self.max_push_constant_size[0], self.max_push_constant_size[1])?;
+        writeln!(f, "max_non_sampler_bindings: {}, {}", self.max_non_sampler_bindings[0], self.max_non_sampler_bindings[1])?;
+        writeln!(f, "}}")?;
+
+        Ok(())
+    }
+}
+impl LimitsCmp {
+    #[rustfmt::skip]
+    fn new(a: &wgpu::Limits, b: &wgpu::Limits) -> Self {
+        Self {
+            max_texture_dimension_1d: [a.max_texture_dimension_1d, b.max_texture_dimension_1d],
+            max_texture_dimension_2d: [a.max_texture_dimension_2d, b.max_texture_dimension_2d],
+            max_texture_dimension_3d: [a.max_texture_dimension_3d, b.max_texture_dimension_3d],
+            max_texture_array_layers: [a.max_texture_array_layers, b.max_texture_array_layers],
+            max_bind_groups: [a.max_bind_groups, b.max_bind_groups],
+            max_bindings_per_bind_group: [a.max_bindings_per_bind_group, b.max_bindings_per_bind_group],
+            max_dynamic_uniform_buffers_per_pipeline_layout: [a.max_dynamic_uniform_buffers_per_pipeline_layout, b.max_dynamic_uniform_buffers_per_pipeline_layout],
+            max_dynamic_storage_buffers_per_pipeline_layout: [a.max_dynamic_storage_buffers_per_pipeline_layout, b.max_dynamic_storage_buffers_per_pipeline_layout],
+            max_sampled_textures_per_shader_stage: [a.max_sampled_textures_per_shader_stage, b.max_sampled_textures_per_shader_stage],
+            max_samplers_per_shader_stage: [a.max_samplers_per_shader_stage, b.max_samplers_per_shader_stage],
+            max_storage_buffers_per_shader_stage: [a.max_storage_buffers_per_shader_stage, b.max_storage_buffers_per_shader_stage],
+            max_storage_textures_per_shader_stage: [a.max_storage_textures_per_shader_stage, b.max_storage_textures_per_shader_stage],
+            max_uniform_buffers_per_shader_stage: [a.max_uniform_buffers_per_shader_stage, b.max_uniform_buffers_per_shader_stage],
+            max_uniform_buffer_binding_size: [a.max_uniform_buffer_binding_size, b.max_uniform_buffer_binding_size].map(HumanSize),
+            max_storage_buffer_binding_size: [a.max_storage_buffer_binding_size, b.max_storage_buffer_binding_size].map(HumanSize),
+            max_vertex_buffers: [a.max_vertex_buffers, b.max_vertex_buffers],
+            max_buffer_size: [a.max_buffer_size, b.max_buffer_size].map(HumanSize),
+            max_vertex_attributes: [a.max_vertex_attributes, b.max_vertex_attributes],
+            max_vertex_buffer_array_stride: [a.max_vertex_buffer_array_stride, b.max_vertex_buffer_array_stride],
+            min_uniform_buffer_offset_alignment: [a.min_uniform_buffer_offset_alignment, b.min_uniform_buffer_offset_alignment],
+            min_storage_buffer_offset_alignment: [a.min_storage_buffer_offset_alignment, b.min_storage_buffer_offset_alignment],
+            max_inter_stage_shader_components: [a.max_inter_stage_shader_components, b.max_inter_stage_shader_components],
+            max_compute_workgroup_storage_size: [a.max_compute_workgroup_storage_size, b.max_compute_workgroup_storage_size].map(HumanSize),
+            max_compute_invocations_per_workgroup: [a.max_compute_invocations_per_workgroup, b.max_compute_invocations_per_workgroup],
+            max_compute_workgroup_size_x: [a.max_compute_workgroup_size_x, b.max_compute_workgroup_size_x],
+            max_compute_workgroup_size_y: [a.max_compute_workgroup_size_y, b.max_compute_workgroup_size_y],
+            max_compute_workgroup_size_z: [a.max_compute_workgroup_size_z, b.max_compute_workgroup_size_z],
+            max_compute_workgroups_per_dimension: [a.max_compute_workgroups_per_dimension, b.max_compute_workgroups_per_dimension],
+            max_push_constant_size: [a.max_push_constant_size, b.max_push_constant_size],
+            max_non_sampler_bindings: [a.max_non_sampler_bindings, b.max_non_sampler_bindings],
+        }
+    }
+}
+
 struct State<'a> {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -783,8 +832,11 @@ struct State<'a> {
     surface: wgpu::Surface<'a>,
     surface_config: wgpu::SurfaceConfiguration,
     render_pipeline: wgpu::RenderPipeline,
+    bitpack_render_pipeline: wgpu::RenderPipeline,
     depth_texture: Texture,
     camera_bind_group: wgpu::BindGroup,
+    bitpack_bind_group: wgpu::BindGroup,
+    triangle_storage: wgpu::Buffer,
     camera: Camera,
     vertex_buffer: wgpu::Buffer,
     t0: Instant,
@@ -792,6 +844,7 @@ struct State<'a> {
     camera_buffer: wgpu::Buffer,
     last_time: Instant,
     last_count: u32,
+    num_bitpack_tris: u32,
 }
 impl<'a> State<'a> {
     fn new(window: &'a winit::window::Window) -> Self {
@@ -822,24 +875,41 @@ impl<'a> State<'a> {
             .copied()
             .find(|f| f.is_srgb())
             .unwrap_or(surface_caps.formats[0]);
+
+        dbg!(adapter.features());
+        dbg!(adapter.get_info());
+
+        let required_limits = wgpu::Limits::downlevel_defaults();
+        println!(
+            "{}",
+            LimitsCmp::new(&adapter.limits(), &required_limits.clone())
+        );
+        let (device, queue) = match adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: None,
+                    required_features: wgpu::Features::INDIRECT_FIRST_INSTANCE
+                        | wgpu::Features::TIMESTAMP_QUERY
+                        | wgpu::Features::VERTEX_WRITABLE_STORAGE, // TODO: omit
+                    required_limits,
+                },
+                None,
+            )
+            .block_on()
+        {
+            Ok(o) => o,
+            Err(e) => panic!("{}", e),
+        };
+
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: 200,
             height: 200,
-            present_mode: wgpu::PresentMode::AutoNoVsync,
+            present_mode: wgpu::PresentMode::AutoVsync, // wgpu::PresentMode::AutoNoVsync,
             desired_maximum_frame_latency: 2,
             alpha_mode: dbg!(&surface_caps.alpha_modes)[0],
             view_formats: vec![],
-        };
-
-        dbg!(adapter.limits());
-        dbg!(adapter.features());
-        dbg!(adapter.get_info());
-
-        let (device, queue) = match adapter.request_device(&default(), None).block_on() {
-            Ok(o) => o,
-            Err(e) => panic!("{}", e),
         };
         surface.configure(&device, &surface_config);
 
@@ -850,7 +920,9 @@ impl<'a> State<'a> {
             source: wgpu::ShaderSource::Wgsl(shader_source.into()),
         });
 
+        // let pre = Instant::now();
         let vert: Vec<_> = cube_march_cpu().into_iter().flatten().collect(); // VERT;
+                                                                             // panic!("{:?}", pre.elapsed());
         let num_vert = vert.len() as u32;
 
         let _ = indexify(&vert);
@@ -910,6 +982,110 @@ impl<'a> State<'a> {
 
         let depth_texture = Texture::new_depth(&device, &surface_config);
 
+        let triangle_storage = MetaBuffer::new_uninit(
+            &device,
+            "tri_buffer",
+            STORAGE | COPY_SRC | COPY_DST | VERTEX,
+            1048576,
+        );
+        let cubemarch = CubeMarch::new();
+        let trigen_state = TriGenState::new(&device, &cubemarch, &triangle_storage);
+        let bitpack_shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(source!("chunk_draw").0),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(source!("chunk_draw").1)),
+        });
+
+        let bitpack_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bitpack_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                trigen_state.render_case_uniform.binding_layout(1),
+            ],
+        });
+
+        let bitpack_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bitpack_bind_group"),
+            layout: &bitpack_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: camera_buffer.as_entire_binding(),
+                },
+                trigen_state.render_case_uniform.binding(1),
+            ],
+        });
+        let bitpack_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("bitpack_pipeline_layout"),
+                bind_group_layouts: &[&bitpack_layout],
+                push_constant_ranges: &[],
+            });
+
+        let bitpack_vertex_buffer_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<u32>() as _,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &wgpu::vertex_attr_array![0 => Uint32],
+        };
+        let bitpack_render_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("bitpack_render_pipeline"),
+                layout: Some(&bitpack_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &bitpack_shader_module,
+                    entry_point: "vs_main",
+                    buffers: &[bitpack_vertex_buffer_layout],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: Texture::DEPTH_FORMAT,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &bitpack_shader_module,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_config.format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview: None,
+            });
+
+        // let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+        //     label: Some("query_set"),
+        //     ty: wgpu::QueryType::Timestamp,
+        //     count: 2,
+        // });
+
+        let num_bitpack_tris = trigen_state.dispatch(&device, &queue);
+
+        trigen_state.inspect(&triangle_storage, &device, &queue);
 
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: None,
@@ -968,13 +1144,49 @@ impl<'a> State<'a> {
             camera_buffer,
             last_time,
             last_count,
+            bitpack_render_pipeline,
+            bitpack_bind_group,
+            triangle_storage: triangle_storage.buffer,
+            num_bitpack_tris,
         }
     }
     fn render(&mut self) {
         let output = self.surface.get_current_texture().unwrap();
         let view = &output.texture.create_view(&default());
         let mut encoder = self.device.create_command_encoder(&default());
-        {
+        if false {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.1,
+                            g: 0.2,
+                            b: 0.3,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_texture.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+
+            render_pass.draw(0..self.num_vert, 0..1);
+        } else {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1003,10 +1215,11 @@ impl<'a> State<'a> {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            render_pass.draw(0..self.num_vert, 0..1);
+            render_pass.set_pipeline(&self.bitpack_render_pipeline);
+            render_pass.set_vertex_buffer(0, self.triangle_storage.slice(..));
+            render_pass.set_bind_group(0, &self.bitpack_bind_group, &[]);
+            // render_pass.multi_draw_indirect(&self.vertex_buffer, 0, 1);
+            render_pass.draw(0..3, 0..self.num_bitpack_tris);
         }
         self.camera = Camera::new(&self.surface_config);
         let t = self.t0.elapsed().as_secs_f32();

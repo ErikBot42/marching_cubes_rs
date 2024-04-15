@@ -1,17 +1,17 @@
-const case_triangle_count: array<u32> = array(
-    0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 2, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 3, 
-    1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 3, 2, 3, 3, 2, 3, 4, 4, 3, 3, 4, 4, 3, 4, 3, 3, 2, 
-    1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 3, 2, 3, 3, 4, 3, 2, 4, 3, 3, 4, 4, 3, 4, 3, 3, 2, 
-    2, 3, 3, 4, 3, 4, 4, 3, 3, 4, 4, 3, 4, 3, 3, 2, 3, 4, 4, 3, 4, 3, 3, 2, 4, 3, 3, 2, 3, 2, 2, 1, 
-    1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 3, 2, 3, 3, 4, 3, 4, 4, 3, 3, 4, 4, 3, 4, 3, 3, 2, 
-    2, 3, 3, 4, 3, 4, 4, 3, 3, 4, 2, 3, 4, 3, 3, 2, 3, 4, 4, 3, 4, 3, 3, 2, 4, 3, 3, 2, 3, 2, 2, 1, 
-    2, 3, 3, 4, 3, 4, 4, 3, 3, 4, 4, 3, 2, 3, 3, 2, 3, 4, 4, 3, 4, 3, 3, 2, 4, 3, 3, 2, 3, 2, 2, 1, 
-    3, 4, 4, 3, 4, 3, 3, 2, 4, 3, 3, 2, 3, 2, 2, 1, 2, 3, 3, 2, 3, 2, 2, 1, 3, 2, 2, 1, 2, 1, 1, 0
-);
-
-const case_triangle_offset: array<u32> = array(...);
-
-const case_triangle_number: array<u32> = array(...);
+// const case_triangle_count: array<u32> = array(
+//     0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 2, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 3, 
+//     1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 3, 2, 3, 3, 2, 3, 4, 4, 3, 3, 4, 4, 3, 4, 3, 3, 2, 
+//     1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 3, 2, 3, 3, 4, 3, 2, 4, 3, 3, 4, 4, 3, 4, 3, 3, 2, 
+//     2, 3, 3, 4, 3, 4, 4, 3, 3, 4, 4, 3, 4, 3, 3, 2, 3, 4, 4, 3, 4, 3, 3, 2, 4, 3, 3, 2, 3, 2, 2, 1, 
+//     1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 3, 2, 3, 3, 4, 3, 4, 4, 3, 3, 4, 4, 3, 4, 3, 3, 2, 
+//     2, 3, 3, 4, 3, 4, 4, 3, 3, 4, 2, 3, 4, 3, 3, 2, 3, 4, 4, 3, 4, 3, 3, 2, 4, 3, 3, 2, 3, 2, 2, 1, 
+//     2, 3, 3, 4, 3, 4, 4, 3, 3, 4, 4, 3, 2, 3, 3, 2, 3, 4, 4, 3, 4, 3, 3, 2, 4, 3, 3, 2, 3, 2, 2, 1, 
+//     3, 4, 4, 3, 4, 3, 3, 2, 4, 3, 3, 2, 3, 2, 2, 1, 2, 3, 3, 2, 3, 2, 2, 1, 3, 2, 2, 1, 2, 1, 1, 0
+// );
+// 
+// const case_triangle_offset: array<u32> = array(...);
+// 
+// const case_triangle_number: array<u32> = array(...);
 
 // const case_triangle_edges: array<array<u32, 3>> = array(...);
 
@@ -23,16 +23,29 @@ var<storage, read_write> sdf_data: array<f32>;
 @group(0) @binding(1)
 var<storage, read_write> triangle_count_prefix: array<u32>; 
 
-@group(0) @binding(1)
+@group(0) @binding(2)
 var<storage, read_write> triangle_storage: array<u32>; 
 
+@group(0) @binding(3)
+var<storage, read> this_u: TriWriteBackUniform;
+
+@group(0) @binding(4)
+var<uniform> chunk: Chunk;
+
 struct Chunk {
-    pos: vec3<i32>;
+    pos: vec3<i32>,
     write_offset: u32,
 }
 
-@group(0) @binding(2)
-var<uniform> chunk: Chunk;
+struct TriWriteBackUniform {
+    offset_to_bitpack: array<u32, 732>,
+    case_to_offset: array<u32, 257>,
+    _unused0: u32,
+    _unused1: u32,
+    _unused2: u32,
+}
+
+
 
 @compute @workgroup_size(128, 1, 1)
 fn main(
@@ -42,28 +55,40 @@ fn main(
 
     let gid = global_id.x;
     var c = triangle_count_prefix[gid];
-    let src_idx = (gid / 128u) * 128u
-    if gid % 128u != 127u && src_idx != 0u {
-        c += triangle_count_prefix[src_idx - 1u];
+    let src_idx = (gid / 128u) * 128u;
+    if gid % 128u != 0u {
+        c += triangle_count_prefix[src_idx];
     }
 
-    let write_start = c + chunk.write_offset;
+    // ONLY FOR DEBUG THIS WRITE IS NOT NEEDED:
+    // triangle_count_prefix[gid] = c;
+    // END DEBUG WRITE
 
 
-    var idx = 0;
+    let write_start: u32 = c + chunk.write_offset;
 
 
-    let sd = array(
-        sdf_data[id],
-        sdf_data[id+1u],
-        sdf_data[id+32u],
-        sdf_data[id+33u],
-        sdf_data[id+1024u], 
-        sdf_data[id+1025u],
-        sdf_data[id+1056u],
-        sdf_data[id+1057u],
+    let dx: u32 = 1u;
+    let dy: u32 = 33u;
+    let dz: u32 = 33u*33u;
+
+    let x: u32 = gid % 32u;
+    let y: u32 = (gid / 32u) % 32u;
+    let z: u32 = gid / 1024u;
+
+    let id: u32 = x + y * 33u + z * 33u * 33u;
+    var sd: array<f32, 8> = array(
+        sdf_data[id + (0u + 0u + 0u)],
+        sdf_data[id + (dx + 0u + 0u)],
+        sdf_data[id + (0u + dy + 0u)],
+        sdf_data[id + (dx + dy + 0u)],
+        sdf_data[id + (0u + 0u + dz)], 
+        sdf_data[id + (dx + 0u + dz)],
+        sdf_data[id + (0u + dy + dz)],
+        sdf_data[id + (dx + dy + dz)],
     );
 
+    var idx: u32 = 0u;
     idx |= u32(sd[0]>0.0) << 0u;
     idx |= u32(sd[1]>0.0) << 1u;
     idx |= u32(sd[2]>0.0) << 2u;
@@ -73,31 +98,57 @@ fn main(
     idx |= u32(sd[6]>0.0) << 6u;
     idx |= u32(sd[7]>0.0) << 7u;
 
-    let tris = case_triangle_count[idx];
+    let tris: u32 = this_u.case_to_offset[idx + 1u] - this_u.case_to_offset[idx];
 
-    let x = gid % 32u;
-    let y = (gid / 32u) % 32u;
-    let z = gid / 1024u;
 
     // ________ _____ _____ _____ ___ ___ ___
     // TTTTTTTT XXXXX YYYYY ZZZZZ AAA BBB CCC 
     // 8T       5X    5Y    5Z    3A  3B  3C
     // 0123
-    for (var i: u32 = 0u; i < tris; i += 1) {
-        let case_data_idx = case_triangle_offset[idx] + i;
+    for (var i: u32 = 0u; i < tris; i += 1u) {
+        let case_data_idx: u32 = this_u.case_to_offset[idx] + i;
 
-        let triangle = case_triangle_number[case_data_idx];
+        let bitpack = this_u.offset_to_bitpack[case_data_idx];
+        let triangle = bitpack & 255u;// bitpack >> 18;
         // let edges = case_triangle_edges[case_data_idx];
 
-        var bit = 0;
+
+        let c0 = sd[(bitpack >> 8u) & 7u];
+        let c1 = sd[(bitpack >> 11u) & 7u];
+
+        let t0 = interpolate_bits(c0, c1);
+
+        let c2 = sd[(bitpack >> 14u) & 7u];
+        let c3 = sd[(bitpack >> 17u) & 7u];
+
+        let t1 = interpolate_bits(c2, c3);
+
+        let c4 = sd[(bitpack >> 20u) & 7u];
+        let c5 = sd[(bitpack >> 23u) & 7u];
+
+        let t2 = interpolate_bits(c4, c5);
+
+        var bit: u32 = 0u;
         bit |= triangle;
-        bit |= x >> 5;
-        bit |= y >> 10;
-        bit |= z >> 15;
+        bit |= x << 8;
+        bit |= y << 13;
+        bit |= z << 18;
+        bit |= t0 << 23;
+        bit |= t1 << 26;
+        bit |= t2 << 29;
 
-        triangle_storage[i + write_start] = bit;
+        triangle_storage[i + write_start] =  bit;
     }
-
-
-
 }
+
+fn interpolate_bits(a: f32, b: f32) -> u32 {
+    let sa = abs(a);
+    let sb = abs(b);
+    let s = sa / (sa + sb);
+
+    //return u32(clamp(i32(round(8 * s + 0.5)), 0, 7));
+    return u32(clamp(i32(round(7 * s)), 0, 7));
+    // return u32(clamp(i32(round(8 * s)), 0, 7));
+}
+
+

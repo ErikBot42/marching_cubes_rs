@@ -40,7 +40,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let l = max(dot(v, light), 0.0);
 
-
     return vec4<f32>(l, 0.0, 0.0, 1.0);
 
     //return vec4<f32>(sin(in.clip_position.z * 400.0) * 0.5 + 0.25, 0.0, 0.0, 1.0);

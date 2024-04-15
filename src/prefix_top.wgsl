@@ -1,7 +1,7 @@
 
 
 
-@group(0) @binding(1)
+@group(0) @binding(0)
 var<storage, read_write> triangle_count_prefix: array<u32>; 
 
 
@@ -13,7 +13,8 @@ fn main(
     @builtin(local_invocation_id) local_id: vec3<u32>,
 ) {
     let i = local_id.x;
-    var c = triangle_count_prefix[i * 128 + 1];
+    let rw_idx = i * 128u + 128u;
+    var c = triangle_count_prefix[rw_idx];
     wg0[i] = c;
     workgroupBarrier(); if i >= 1u   { c += wg0[i-1u];   } wg1[i] = c;
     workgroupBarrier(); if i >= 2u   { c += wg1[i-2u];   } wg0[i] = c;
@@ -24,6 +25,6 @@ fn main(
     workgroupBarrier(); if i >= 64u  { c += wg0[i-64u];  } wg1[i] = c;
     workgroupBarrier(); if i >= 128u { c += wg1[i-128u]; } 
 
-    triangle_count_prefix[i * 128 + 1] = c;
+    triangle_count_prefix[rw_idx] = c;
 }
 
