@@ -25,20 +25,27 @@ fn vs_main(
     data: VertexInput,
 ) -> VertexOutput {
 
+    let vid = data.vertex_index % 3u;
+
+    let pos_mask = (data.vertex_index - vid) / 3u;
+
+    let pos_offset = vec3<f32>(vec3<u32>(pos_mask & 1023u, (pos_mask >> 10u) & 1023u, (pos_mask >> 20u) & 1023u)) * 2.0;
+
+
     let tri = data.mask & 255u;
-    let x = (data.mask >> 8) & 31;
-    let y = (data.mask >> 13) & 31;
-    let z = (data.mask >> 18) & 31;
+    let x = (data.mask >> 8u) & 31u;
+    let y = (data.mask >> 13u) & 31u;
+    let z = (data.mask >> 18u) & 31u;
 
-    let rcase = (render_case[tri] >> ((data.vertex_index) * 6u)) & 63u;
+    let rcase = (render_case[tri] >> (vid * 6u)) & 63u;
 
-    let w = ((data.mask >> (23 + data.vertex_index*3u)) & 7) * 2;
+    let w = ((data.mask >> (23u + vid * 3u)) & 7u) * 2u;
     let pos0 = vec3<u32>((rcase >> 0) & 1, (rcase >> 1) & 1, (rcase >> 2) & 1) * (14 - w);
     let pos1 = vec3<u32>((rcase >> 3) & 1, (rcase >> 4) & 1, (rcase >> 5) & 1) * (w);
 
     let c = vec3<u32>(x, y, z) * 2 * 7 + pos0 + pos1;
 
-    let pos = (vec3<f32>(c)/7.0 - 32.0) * (1.0 / 32.0);
+    let pos = (vec3<f32>(c)/7.0 - 32.0) * (1.0 / 32.0) + pos_offset;
 
     var out: VertexOutput;
     out.clip_position = camera.view_proj * vec4<f32>(pos, 1.0);

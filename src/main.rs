@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     fmt::Display,
     marker::Copy,
+    mem::size_of,
     slice::from_ref,
     time::Instant,
 };
@@ -22,6 +23,7 @@ wgpu::DrawIndirectArgs {
 }
 */
 
+#[derive(Debug)]
 struct DataEntry {
     offset: u32,
     count: u32,
@@ -35,7 +37,6 @@ struct Storage {
     b0: MetaBuffer,
     //b1: MetaBuffer,
     data: Vec<DataEntry>,
-    sorted: Vec<u32>, // closest at start.
     in_queue: BTreeSet<(u32, u32, u32)>,
     compute_queue: VecDeque<(u32, u32, u32)>,
     count_staging_buffer: MetaBuffer,
@@ -43,64 +44,128 @@ struct Storage {
     recv: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
     awaiting: Option<(u32, u32, u32)>,
     offset: u32,
+    capacity: u32,
+    trigen: TriGenState,
 }
 impl Storage {
     fn new(device: &wgpu::Device, cube_march: &CubeMarch) -> Self {
-        todo!()
+        let (send, recv) = std::sync::mpsc::channel();
+        // 128 MiB = 134 million triangles
+        // let capacity: u32 = 32 * 1024 * 1024;
+        let capacity: u32 = 511 * 1024 * 1024;
+        let b0 = MetaBuffer::new_uninit(device, "b0", STORAGE | VERTEX, (capacity as u64) * 4);
+        let data = Vec::new();
+        let in_queue = BTreeSet::new();
+        let compute_queue = VecDeque::new();
+        let count_staging_buffer = MetaBuffer::new_uninit(
+            device,
+            "staging",
+            COPY_DST | MAP_READ,
+            size_of::<u32>() as u64,
+        );
+        let awaiting = None;
+        let offset = 0;
+        let trigen = TriGenState::new(device, cube_march, &b0);
+        Self {
+            b0,
+            data,
+            in_queue,
+            compute_queue,
+            count_staging_buffer,
+            send,
+            recv,
+            awaiting,
+            offset,
+            trigen,
+            capacity,
+        }
     }
     fn dispatch(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         let target: (u32, u32, u32) = (0, 0, 0);
-        let radius = 10;
+        let radius = 100;
 
-        for x in target.0.saturating_sub(radius)..(target.0 + radius).min(1023) {
-            for y in target.1.saturating_sub(radius)..(target.1 + radius).min(1023) {
-                for z in target.2.saturating_sub(radius)..(target.2 + radius).min(1023) {
-                    if self.in_queue.insert((x, y, z)) {
-                        self.compute_queue.push_back((x, y, z));
+        if (self.capacity as f64) < (self.offset as f64) * 1.1 {
+            return;
+        }
+
+        if self.compute_queue.len() == 0 {
+            for x in target.0.saturating_sub(radius)..(target.0 + radius).min(1023) {
+                for y in target.1.saturating_sub(radius)..(target.1 + radius).min(1023) {
+                    for z in target.2.saturating_sub(radius)..(target.2 + radius).min(1023) {
+                        if self.in_queue.insert((x, y, z)) {
+                            self.compute_queue.push_back((x, y, z));
+                        }
                     }
                 }
             }
         }
 
-        let Some((x, y, z)) = self.compute_queue.pop_front() else {
-            return;
-        };
+        for _ in 0..4000 {
+            if (self.capacity as f64) < (self.offset as f64) * 1.1 {
+                return;
+            }
+            let Some((x, y, z)) = self.compute_queue.pop_front() else {
+                return;
+            };
 
-        if let Some((x, y, z)) = self.awaiting.take() {
-            let _: () = self.recv.recv().unwrap().unwrap();
-            let count = bytemuck::cast_slice::<u8, u32>(
-                &self
-                    .count_staging_buffer
-                    .buffer
-                    .slice(..)
-                    .get_mapped_range(),
-            )[0];
-            self.count_staging_buffer.buffer.unmap();
-            let entry = DataEntry {
-                offset: self.offset,
-                count,
+            if let Some((x, y, z)) = self.awaiting.take() {
+                device.poll(wgpu::Maintain::Wait);
+                let _: () = self.recv.recv().unwrap().unwrap(); // TODO: read and unmap in callback.
+                let count = bytemuck::cast_slice::<u8, u32>(
+                    &self
+                        .count_staging_buffer
+                        .buffer
+                        .slice(..)
+                        .get_mapped_range(),
+                )[0];
+                self.count_staging_buffer.buffer.unmap();
+                let entry = DataEntry {
+                    offset: self.offset,
+                    count,
+                    x,
+                    y,
+                    z,
+                };
+                self.offset += count;
+                self.data.push(entry);
+            }
+
+            let chunk = ChunkUniform {
                 x,
                 y,
                 z,
+                offset: self.offset,
             };
-            self.offset += count;
-            self.data.push(entry);
+            self.trigen.chunk.write(queue, chunk);
+
+            let mut encoder = device.create_command_encoder(&default());
+            self.trigen
+                .dispatch(&mut encoder, &self.count_staging_buffer);
+            queue.submit([encoder.finish()]); // submit needed to map buffer later.
+
+            self.awaiting = Some((x, y, z));
+            let sender = self.send.clone();
+            self.count_staging_buffer
+                .buffer
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |x| sender.send(x).unwrap());
         }
-
-        let chunk = ChunkUniform { x, y, z, offset: self.offset };
-
-        // dispatch here
-
-        self.awaiting = Some((x, y, z));
-        let sender = self.send.clone();
-        self.count_staging_buffer
-            .buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |x| sender.send(x).unwrap());
     }
-    fn draw<'this, 'pass>(&'this mut self, pass: &'pass mut wgpu::RenderPass) where 'this: 'pass{
-        for &DataEntry { offset, count, x, y, z } in &self.data {
-            pass.draw(0..3, offset..(offset+count));
+    fn draw<'this, 'pass>(&'this mut self, pass: &mut wgpu::RenderPass<'pass>)
+    where
+        'this: 'pass,
+    {
+        pass.set_vertex_buffer(0, self.b0.buffer.slice(..));
+        for &DataEntry {
+            offset,
+            count,
+            x,
+            y,
+            z,
+        } in &self.data
+        {
+            let encoded = (x | (y << 10) | (z << 20)) * 3;
+            pass.draw(encoded..(encoded + 3), offset..(offset + count));
         }
     }
 }
@@ -304,7 +369,7 @@ impl MetaBuffer {
             resource: self.buffer.as_entire_binding(),
         }
     }
-    fn write<T: bytemuck::NoUninit>(&self, queue: wgpu::Queue, data: T) {
+    fn write<T: bytemuck::NoUninit>(&self, queue: &wgpu::Queue, data: T) {
         queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&[data]));
     }
 }
@@ -415,7 +480,7 @@ struct TriGenState {
     //case_triangle_number: MetaBuffer,
     /// `32^3`
     triangle_writeback: Kernel,
-    triangle_count_buffer: MetaBuffer,
+    staging_buffer: MetaBuffer,
     render_case_uniform: MetaBuffer,
     // query_buffer0: MetaBuffer,
     // query_buffer1: MetaBuffer,
@@ -427,7 +492,7 @@ impl TriGenState {
 
         let triangle_count_prefix = MetaBuffer::new(device, "triangle_count_prefix", COPY_SRC, &vec![0_u32; 32*32*32 + 1]);
 
-        let triangle_count_buffer = MetaBuffer::new_uninit(device, "tri count buffer", COPY_DST | MAP_READ, std::mem::size_of::<u32>() as u64);
+        let staging_buffer = MetaBuffer::new_uninit(device, "tri count buffer", COPY_DST | MAP_READ, size_of::<u32>() as u64);
 
         // let query_buffer0 = MetaBuffer::new_uninit(device, "query buffer0", COPY_SRC | QUERY_RESOLVE, (std::mem::size_of::<u64>() * 2) as u64);
         // let query_buffer1 = MetaBuffer::new_uninit(device, "query buffer1", COPY_DST | MAP_READ, (std::mem::size_of::<u64>() * 2) as u64);
@@ -458,19 +523,21 @@ impl TriGenState {
             triangle_count_prefix,
             prefix_top,
             triangle_writeback,
-            triangle_count_buffer,
+            staging_buffer,
             render_case_uniform,
             // query_buffer0,
             // query_buffer1,
         }
 
     }
-    fn dispatch<'s: 'c, 'c>(
-        &'s self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue, /*, qset: &wgpu::QuerySet*/
-    ) -> u32 {
-        let mut encoder = device.create_command_encoder(&default());
+    fn dispatch(
+        &self,
+        //device: &wgpu::Device,
+        //queue: &wgpu::Queue, /*, qset: &wgpu::QuerySet*/
+        encoder: &mut wgpu::CommandEncoder,
+        staging_buffer: &MetaBuffer,
+    ) {
+        // let mut encoder = device.create_command_encoder(&default());
         //encoder.write_timestamp(qset, 0);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: None,
@@ -487,29 +554,29 @@ impl TriGenState {
         encoder.copy_buffer_to_buffer(
             &self.triangle_count_prefix.buffer,
             (32 * 32 * 32) * 4,
-            &self.triangle_count_buffer.buffer,
+            &staging_buffer.buffer,
             0,
             4,
         );
         //encoder.resolve_query_set(&qset, 0..2, &self.query_buffer0.buffer, 0);
         //encoder.copy_buffer_to_buffer(&self.query_buffer0.buffer, 0, &self.query_buffer1.buffer, 0, 2 * std::mem::size_of::<u64>() as u64);
-        queue.submit([encoder.finish()]);
+        // queue.submit([encoder.finish()]);
         //self.query_buffer1.buffer.slice(..).map_async(wgpu::MapMode::Read, |x| x.unwrap());
-        self.triangle_count_buffer
-            .buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, |x| x.unwrap());
-        device.poll(wgpu::Maintain::Wait);
-        let tmp = self
-            .triangle_count_buffer
-            .buffer
-            .slice(..)
-            .get_mapped_range();
-        let data: &[u32] = bytemuck::cast_slice(&tmp);
-        //println!("Expected triangles written: {}.", data[0]);
-        let num_tris = data[0];
-        drop(tmp);
-        self.triangle_count_buffer.buffer.unmap();
+        // self.staging_buffer
+        //     .buffer
+        //     .slice(..)
+        //     .map_async(wgpu::MapMode::Read, |x| x.unwrap());
+        // device.poll(wgpu::Maintain::Wait);
+        // let tmp = self
+        //     .staging_buffer
+        //     .buffer
+        //     .slice(..)
+        //     .get_mapped_range();
+        // let data: &[u32] = bytemuck::cast_slice(&tmp);
+        // //println!("Expected triangles written: {}.", data[0]);
+        // let num_tris = data[0];
+        // drop(tmp);
+        // self.staging_buffer.buffer.unmap();
 
         //let tmp2 = self.query_buffer1.buffer.slice(..).get_mapped_range();
         //let data2: &[u64] = bytemuck::cast_slice(&tmp2);
@@ -521,37 +588,37 @@ impl TriGenState {
 
         // panic!("{dur:?}");
 
-        num_tris
+        // num_tris
     }
-    fn inspect(&self, triangle_storage: &MetaBuffer, device: &wgpu::Device, queue: &wgpu::Queue) {
-        let read_buf = triangle_storage;
+    // fn inspect(&self, triangle_storage: &MetaBuffer, device: &wgpu::Device, queue: &wgpu::Queue) {
+    //     let read_buf = triangle_storage;
 
-        let bytes = 3000 * 4;
+    //     let bytes = 3000 * 4;
 
-        let tmp_buf = MetaBuffer::new_uninit(device, "tmp dst", MAP_READ | COPY_DST, bytes);
+    //     let tmp_buf = MetaBuffer::new_uninit(device, "tmp dst", MAP_READ | COPY_DST, bytes);
 
-        let mut encoder = device.create_command_encoder(&default());
+    //     let mut encoder = device.create_command_encoder(&default());
 
-        encoder.copy_buffer_to_buffer(&read_buf.buffer, 0, &tmp_buf.buffer, 0, bytes);
-        queue.submit([encoder.finish()]);
+    //     encoder.copy_buffer_to_buffer(&read_buf.buffer, 0, &tmp_buf.buffer, 0, bytes);
+    //     queue.submit([encoder.finish()]);
 
-        tmp_buf
-            .buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, |_| ());
-        device.poll(wgpu::Maintain::Wait);
+    //     tmp_buf
+    //         .buffer
+    //         .slice(..)
+    //         .map_async(wgpu::MapMode::Read, |_| ());
+    //     device.poll(wgpu::Maintain::Wait);
 
-        let slice: &[u8] = &tmp_buf.buffer.slice(..).get_mapped_range();
+    //     let slice: &[u8] = &tmp_buf.buffer.slice(..).get_mapped_range();
 
-        let slice_u32: &[u32] = bytemuck::cast_slice(slice);
-        println!("{slice_u32:?}");
+    //     let slice_u32: &[u32] = bytemuck::cast_slice(slice);
+    //     println!("{slice_u32:?}");
 
-        // let diff = slice_u32.windows(2).map(|w| w[1] - w[0]).collect::<Vec<_>>();
-        // println!("{diff:?}");
-        // for c in slice_u32[1..].chunks(128) {
-        //     println!("{:?}", c.last());
-        // }
-    }
+    //     // let diff = slice_u32.windows(2).map(|w| w[1] - w[0]).collect::<Vec<_>>();
+    //     // println!("{diff:?}");
+    //     // for c in slice_u32[1..].chunks(128) {
+    //     //     println!("{:?}", c.last());
+    //     // }
+    // }
 }
 
 fn cmap<U: Copy, V: Copy, const N: usize>(a: [U; N], f: fn(U) -> V, v_default: V) -> [V; N] {
@@ -836,7 +903,7 @@ struct State<'a> {
     depth_texture: Texture,
     camera_bind_group: wgpu::BindGroup,
     bitpack_bind_group: wgpu::BindGroup,
-    triangle_storage: wgpu::Buffer,
+    // triangle_storage: wgpu::Buffer,
     camera: Camera,
     vertex_buffer: wgpu::Buffer,
     t0: Instant,
@@ -844,7 +911,7 @@ struct State<'a> {
     camera_buffer: wgpu::Buffer,
     last_time: Instant,
     last_count: u32,
-    num_bitpack_tris: u32,
+    storage: Storage,
 }
 impl<'a> State<'a> {
     fn new(window: &'a winit::window::Window) -> Self {
@@ -868,6 +935,7 @@ impl<'a> State<'a> {
             .into_iter()
             .find(|a| dbg!(a).is_surface_supported(&surface))
             .unwrap();
+        let adapter_limits = adapter.limits();
         let surface_caps = dbg!(surface.get_capabilities(&adapter));
         let surface_format = surface_caps
             .formats
@@ -879,11 +947,11 @@ impl<'a> State<'a> {
         dbg!(adapter.features());
         dbg!(adapter.get_info());
 
-        let required_limits = wgpu::Limits::downlevel_defaults();
-        println!(
-            "{}",
-            LimitsCmp::new(&adapter.limits(), &required_limits.clone())
-        );
+        let mut required_limits = wgpu::Limits::downlevel_defaults();
+        required_limits.max_storage_buffer_binding_size =
+            adapter_limits.max_storage_buffer_binding_size;
+        required_limits.max_buffer_size = adapter_limits.max_buffer_size;
+        println!("{}", LimitsCmp::new(&adapter.limits(), &required_limits));
         let (device, queue) = match adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
@@ -928,7 +996,7 @@ impl<'a> State<'a> {
         let _ = indexify(&vert);
 
         let vertex_buffer_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Vertex>() as _,
+            array_stride: size_of::<Vertex>() as _,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![0 => Float32x3],
         };
@@ -982,14 +1050,16 @@ impl<'a> State<'a> {
 
         let depth_texture = Texture::new_depth(&device, &surface_config);
 
-        let triangle_storage = MetaBuffer::new_uninit(
-            &device,
-            "tri_buffer",
-            STORAGE | COPY_SRC | COPY_DST | VERTEX,
-            1048576,
-        );
+        // let triangle_storage = MetaBuffer::new_uninit(
+        //     &device,
+        //     "tri_buffer",
+        //     STORAGE | COPY_SRC | COPY_DST | VERTEX,
+        //     1048576,
+        // );
         let cubemarch = CubeMarch::new();
-        let trigen_state = TriGenState::new(&device, &cubemarch, &triangle_storage);
+        let storage = Storage::new(&device, &cubemarch);
+        let triangle_storage = &storage.b0;
+        // let trigen_state = TriGenState::new(&device, &cubemarch, &triangle_storage);
         let bitpack_shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(source!("chunk_draw").0),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(source!("chunk_draw").1)),
@@ -1008,7 +1078,7 @@ impl<'a> State<'a> {
                     },
                     count: None,
                 },
-                trigen_state.render_case_uniform.binding_layout(1),
+                storage.trigen.render_case_uniform.binding_layout(1),
             ],
         });
 
@@ -1020,7 +1090,7 @@ impl<'a> State<'a> {
                     binding: 0,
                     resource: camera_buffer.as_entire_binding(),
                 },
-                trigen_state.render_case_uniform.binding(1),
+                storage.trigen.render_case_uniform.binding(1),
             ],
         });
         let bitpack_pipeline_layout =
@@ -1031,7 +1101,7 @@ impl<'a> State<'a> {
             });
 
         let bitpack_vertex_buffer_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<u32>() as _,
+            array_stride: size_of::<u32>() as _,
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &wgpu::vertex_attr_array![0 => Uint32],
         };
@@ -1083,9 +1153,9 @@ impl<'a> State<'a> {
         //     count: 2,
         // });
 
-        let num_bitpack_tris = trigen_state.dispatch(&device, &queue);
+        // let num_bitpack_tris = trigen_state.dispatch(&device, &queue);
 
-        trigen_state.inspect(&triangle_storage, &device, &queue);
+        // trigen_state.inspect(&triangle_storage, &device, &queue);
 
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: None,
@@ -1146,14 +1216,14 @@ impl<'a> State<'a> {
             last_count,
             bitpack_render_pipeline,
             bitpack_bind_group,
-            triangle_storage: triangle_storage.buffer,
-            num_bitpack_tris,
+            storage,
         }
     }
     fn render(&mut self) {
         let output = self.surface.get_current_texture().unwrap();
         let view = &output.texture.create_view(&default());
         let mut encoder = self.device.create_command_encoder(&default());
+        self.storage.dispatch(&self.device, &self.queue);
         if false {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
@@ -1216,10 +1286,10 @@ impl<'a> State<'a> {
                 occlusion_query_set: None,
             });
             render_pass.set_pipeline(&self.bitpack_render_pipeline);
-            render_pass.set_vertex_buffer(0, self.triangle_storage.slice(..));
             render_pass.set_bind_group(0, &self.bitpack_bind_group, &[]);
             // render_pass.multi_draw_indirect(&self.vertex_buffer, 0, 1);
-            render_pass.draw(0..3, 0..self.num_bitpack_tris);
+            self.storage.draw(&mut render_pass);
+            // render_pass.draw(0..3, 0..self.num_bitpack_tris);
         }
         self.camera = Camera::new(&self.surface_config);
         let t = self.t0.elapsed().as_secs_f32();
@@ -1229,6 +1299,7 @@ impl<'a> State<'a> {
             2.0 * t.cos(),
         )
             .into();
+        self.camera.eye *= 100.0;
         self.queue.write_buffer(
             &self.camera_buffer,
             0,
@@ -1240,7 +1311,11 @@ impl<'a> State<'a> {
         self.last_count += 1;
         if elapsed > 1.0 {
             let fps = self.last_count as f64 / elapsed;
-            println!("FPS: {fps}");
+            println!(
+                "FPS: {fps}, tri count: {} million, draw calls: {}",
+                self.storage.offset as f64 / 1_000_000.0,
+                self.storage.data.len(),
+            );
 
             self.last_count = 0;
             self.last_time = Instant::now();

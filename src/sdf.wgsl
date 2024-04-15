@@ -10,7 +10,7 @@ fn sdf(x0: i32, y0: i32, z0: i32) -> f32 {
 
     // return sqrt(x * x + y * y + z * z) - 6.0;
     let r = sin(p/2.0) + sin(p*1.0)/5.0;
-    return r.x + r.y + r.z;
+    return r.x + r.y + r.z*3.0;
 }
 
 
@@ -31,7 +31,7 @@ fn main(
     @builtin(global_invocation_id) global_id: vec3<u32>,
 ) {
     let i: i32 = i32(global_id.x);
-    let pos: vec3<i32> = vec3<i32>(i % 33, (i / 33) % 33, i / (33 * 33)) + chunk.pos;
+    let pos: vec3<i32> = vec3<i32>(i % 33, (i / 33) % 33, i / (33 * 33)) + chunk.pos * 32;
     let s: f32 = sdf(pos.x, pos.y, pos.z);
     sdf_data[i] = s;
 }
