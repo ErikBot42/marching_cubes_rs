@@ -6,11 +6,18 @@ fn sdf(x0: i32, y0: i32, z0: i32) -> f32 {
     let y = (f32(y0) / 2.0);// % 30.0 - 8.0;
     let z = (f32(z0) / 2.0);// % 30.0 - 8.0;
     
-    let p = vec3<f32>(x, y, z);
+    let p = vec3<f32>(x, y, z) - 16.0;
 
-    // return sqrt(x * x + y * y + z * z) - 6.0;
-    let r = sin(p/2.0) + sin(p*1.0)/5.0;
-    return r.x + r.y + r.z*3.0;
+
+    return length(p%32.0) - 16.0;
+
+    // return sqrt(p.x * p.x + p.y * p.y + p.z * p.z) - 16.0;
+    //let r = sin(p/2.0) + sin(p*1.0)/5.0;
+    //return r.x + r.y + r.z*3.0 + sin(y * 0.1)*4.0 + sin(z * 0.134234)*2.0 + sin(x * 0.12377823)*3.0;
+    // // let rad = 80.0;
+    // // let t = (abs(p) % (rad * 4.0)) - rad;
+
+    // // return length(t) - rad;
 }
 
 

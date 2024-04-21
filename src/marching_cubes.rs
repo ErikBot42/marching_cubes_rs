@@ -1,4 +1,4 @@
-use std::{array, collections::VecDeque};
+use std::{array, collections::{HashMap, VecDeque}};
 trait SearchExt<T: Copy + Eq> {
     fn indexof(self, t: T) -> usize;
 }
@@ -112,29 +112,31 @@ fn gen_cases() -> Box<CubeMarch> {
     // created manually from the cases presented on wikipedia
     #[rustfmt::skip]
     let cases = [
-        (0, vec![]),
-        (t2, vec![[s02, s23, s26]]),
-        (t2|t3, vec![[s02, s13, s26], [s26, s37, s13]]),
-        (t2|t7, vec![[s02, s23, s26], [s67, s57, s37]]),
-        (t0|t1|t3, vec![[s02, s23, s37], [s02, s04, s37], [s04, s15, s37]]),
+        (0, 0, vec![]),
+        (1, t2, vec![[s02, s23, s26]]),
+        (2, t2|t3, vec![[s02, s13, s26], [s26, s37, s13]]),
+        (3, t2|t7, vec![[s02, s23, s26], [s67, s57, s37]]),
+        (4, t0|t1|t3, vec![[s02, s23, s37], [s02, s04, s37], [s04, s15, s37]]),
         // ----
-        (t0|t1|t2|t3, vec![[s04, s15, s26], [s15, s37, s26]]),
-        (t6|t0|t1|t3, vec![[s46, s67, s26], [s04, s15, s37], [s37, s04, s02], [s23, s37, s02]]),
-        (t4|t7|t2|t1, vec![[s02, s23, s26], [s46, s45, s04], [s67, s57, s37], [s01, s13, s15]]),
-        (t4|t1|t0|t2, vec![[s45, s46, s26], [s26, s45, s23], [s45, s15, s23], [s15, s13, s23]]),
-        (t4|t0|t1|t3, vec![[s45, s15, s46], [s46, s15, s23], [s46, s23, s02], [s23, s15, s37]]),
+        (5, t0|t1|t2|t3, vec![[s04, s15, s26], [s15, s37, s26]]),
+        (6, t6|t0|t1|t3, vec![[s46, s67, s26], [s04, s15, s37], [s37, s04, s02], [s23, s37, s02]]),
+        (7, t4|t7|t2|t1, vec![[s02, s23, s26], [s46, s45, s04], [s67, s57, s37], [s01, s13, s15]]),
+        (8, t4|t1|t0|t2, vec![[s45, s46, s26], [s26, s45, s23], [s45, s15, s23], [s15, s13, s23]]),
+        (9, t4|t0|t1|t3, vec![[s45, s15, s46], [s46, s15, s23], [s46, s23, s02], [s23, s15, s37]]),
         // ----
-        (t2|t5, vec![[s45, s15, s57], [s02, s23, s26]]),
-        (t2|t3|t5, vec![[s45, s15, s57], [s02, s13, s26], [s13, s26, s37]]),
-        (t6|t5|t3, vec![[s46, s67, s26], [s15, s57, s45], [s37, s13, s23]]),
-        (t2|t6|t1|t5, vec![[s46, s02, s23], [s46, s67, s23], [s45, s57, s13], [s01, s13, s45]]),
-        (t1|t5|t2|t0, vec![[s45, s57, s04], [s26, s23, s04], [s04, s57, s23], [s13, s23, s57]]),
+        (10, t2|t5, vec![[s45, s15, s57], [s02, s23, s26]]),
+        (11, t2|t3|t5, vec![[s45, s15, s57], [s02, s13, s26], [s13, s26, s37]]),
+        (12, t6|t5|t3, vec![[s46, s67, s26], [s15, s57, s45], [s37, s13, s23]]),
+        (13, t2|t6|t1|t5, vec![[s46, s02, s23], [s46, s67, s23], [s45, s57, s13], [s01, s13, s45]]),
+        (14, t1|t5|t2|t0, vec![[s45, s57, s04], [s26, s23, s04], [s04, s57, s23], [s13, s23, s57]]),
     ];
     let mut front: VecDeque<_> = cases.into_iter().collect();
 
     let mut found: [_; 256] = std::array::from_fn(|_| None);
 
-    while let Some((i, c)) = front.pop_front() {
+    // let mut vcount: HashMap<usize, usize> = HashMap::new();
+
+    while let Some((vv, i, c)) = front.pop_front() {
         for transform in transforms {
             let mut j = 0;
             for bit in 0..8 {
@@ -158,11 +160,17 @@ fn gen_cases() -> Box<CubeMarch> {
                         })
                     })
                     .collect();
-                front.push_back((j, c));
+                front.push_back((vv, j, c));
             }
         }
+        // if found[i].is_none() {
+        //     *vcount.entry(vv).or_default() += 1;
+        // }
         found[i] = Some(c);
     }
+    // let mut vcount = vcount.into_iter().collect::<Vec<_>>();
+    // vcount.sort();
+    // panic!("{vcount:?}");
     // let found: [Vec<_>; 256] = found.map(|f| {
     //     f.unwrap()
     //         .into_iter()
