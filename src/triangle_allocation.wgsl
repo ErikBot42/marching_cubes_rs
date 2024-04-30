@@ -1,15 +1,4 @@
 
-// const case_triangle_count: array<u32, 256> = array(
-//     0u, 1u, 1u, 2u, 1u, 2u, 2u, 3u, 1u, 2u, 2u, 3u, 2u, 3u, 3u, 2u, 1u, 2u, 2u, 3u, 2u, 3u, 3u, 4u, 2u, 3u, 3u, 4u, 3u, 4u, 4u, 3u, 
-//     1u, 2u, 2u, 3u, 2u, 3u, 3u, 4u, 2u, 3u, 3u, 4u, 3u, 4u, 4u, 3u, 2u, 3u, 3u, 2u, 3u, 4u, 4u, 3u, 3u, 4u, 4u, 3u, 4u, 3u, 3u, 2u, 
-//     1u, 2u, 2u, 3u, 2u, 3u, 3u, 4u, 2u, 3u, 3u, 4u, 3u, 4u, 4u, 3u, 2u, 3u, 3u, 4u, 3u, 2u, 4u, 3u, 3u, 4u, 4u, 3u, 4u, 3u, 3u, 2u, 
-//     2u, 3u, 3u, 4u, 3u, 4u, 4u, 3u, 3u, 4u, 4u, 3u, 4u, 3u, 3u, 2u, 3u, 4u, 4u, 3u, 4u, 3u, 3u, 2u, 4u, 3u, 3u, 2u, 3u, 2u, 2u, 1u, 
-//     1u, 2u, 2u, 3u, 2u, 3u, 3u, 4u, 2u, 3u, 3u, 4u, 3u, 4u, 4u, 3u, 2u, 3u, 3u, 4u, 3u, 4u, 4u, 3u, 3u, 4u, 4u, 3u, 4u, 3u, 3u, 2u, 
-//     2u, 3u, 3u, 4u, 3u, 4u, 4u, 3u, 3u, 4u, 2u, 3u, 4u, 3u, 3u, 2u, 3u, 4u, 4u, 3u, 4u, 3u, 3u, 2u, 4u, 3u, 3u, 2u, 3u, 2u, 2u, 1u, 
-//     2u, 3u, 3u, 4u, 3u, 4u, 4u, 3u, 3u, 4u, 4u, 3u, 2u, 3u, 3u, 2u, 3u, 4u, 4u, 3u, 4u, 3u, 3u, 2u, 4u, 3u, 3u, 2u, 3u, 2u, 2u, 1u, 
-//     3u, 4u, 4u, 3u, 4u, 3u, 3u, 2u, 4u, 3u, 3u, 2u, 3u, 2u, 2u, 1u, 2u, 3u, 3u, 2u, 3u, 2u, 2u, 1u, 3u, 2u, 2u, 1u, 2u, 1u, 1u, 0u
-// );
-
 struct TriAllocUniform {
     case_triangle_count: array<u32, 256>
 }
@@ -23,6 +12,9 @@ var<storage, read_write> sdf_data: array<f32>;
 @group(0) @binding(2)
 var<storage, read_write> triangle_count_prefix: array<u32>; 
 
+// var<workgroup> wg0: array<u32, 128>;
+// var<workgroup> wg1: array<u32, 128>;
+
 var<workgroup> wg0: array<u32, 128>;
 var<workgroup> wg1: array<u32, 128>;
 
@@ -30,8 +22,10 @@ var<workgroup> wg1: array<u32, 128>;
 fn main(
     @builtin(global_invocation_id) global_id: vec3<u32>,
     @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(subgroup_size) subgroup_size: u32,
+    @builtin(subgroup_invocation_id) subgroup_id: u32,
 ) {
-    let gid = global_id.x;
+    let gid: u32 = global_id.x;
 
     var idx: u32 = 0;
 
@@ -58,15 +52,34 @@ fn main(
     let i = local_id.x;
 
     var c = tris;
-    wg0[i] = c;
 
-    workgroupBarrier(); if i >= 1u   { c += wg0[i - 1u];  } wg1[i] = c;
-    workgroupBarrier(); if i >= 2u   { c += wg1[i - 2u];  } wg0[i] = c;
-    workgroupBarrier(); if i >= 4u   { c += wg0[i - 4u];  } wg1[i] = c;
-    workgroupBarrier(); if i >= 8u   { c += wg1[i - 8u];  } wg0[i] = c;
-    workgroupBarrier(); if i >= 16u  { c += wg0[i - 16u]; } wg1[i] = c;
-    workgroupBarrier(); if i >= 32u  { c += wg1[i - 32u]; } wg0[i] = c;
-    workgroupBarrier(); if i >= 64u  { c += wg0[i - 64u]; }
+    // inclusive prefix-sum
+    switch (subgroup_size) {
+    default { 
+        wg0[i] = c;
+        workgroupBarrier(); if i >= 1u   { c += wg0[i - 1u];  } wg1[i] = c;
+        workgroupBarrier(); if i >= 2u   { c += wg1[i - 2u];  } wg0[i] = c;
+        workgroupBarrier(); if i >= 4u   { c += wg0[i - 4u];  } wg1[i] = c;
+        workgroupBarrier(); if i >= 8u   { c += wg1[i - 8u];  } wg0[i] = c;
+        workgroupBarrier(); if i >= 16u  { c += wg0[i - 16u]; } wg1[i] = c;
+        workgroupBarrier(); if i >= 32u  { c += wg1[i - 32u]; } wg0[i] = c;
+        workgroupBarrier(); if i >= 64u  { c += wg0[i - 64u]; }
+    }
+    case 16u: {
+        c = subgroupInclusiveAdd(c);
+
+        if ((i & (16u - 1u)) == (16u - 1u)) {
+            wg0[i >> 4u] = c;
+        }
+        workgroupBarrier();
+        if i < 16u {
+            // gid >= 8u contains trash.
+            wg0[i] = subgroupExclusiveAdd(wg0[i]);
+        }
+        workgroupBarrier();
+        c += wg0[i / 16u];
+    }
+    }
 
     // pseudo-exclusive prefix sum
     triangle_count_prefix[gid+1] = c;

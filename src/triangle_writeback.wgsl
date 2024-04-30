@@ -1,21 +1,3 @@
-// const case_triangle_count: array<u32> = array(
-//     0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 2, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 3, 
-//     1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 3, 2, 3, 3, 2, 3, 4, 4, 3, 3, 4, 4, 3, 4, 3, 3, 2, 
-//     1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 3, 2, 3, 3, 4, 3, 2, 4, 3, 3, 4, 4, 3, 4, 3, 3, 2, 
-//     2, 3, 3, 4, 3, 4, 4, 3, 3, 4, 4, 3, 4, 3, 3, 2, 3, 4, 4, 3, 4, 3, 3, 2, 4, 3, 3, 2, 3, 2, 2, 1, 
-//     1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 3, 2, 3, 3, 4, 3, 4, 4, 3, 3, 4, 4, 3, 4, 3, 3, 2, 
-//     2, 3, 3, 4, 3, 4, 4, 3, 3, 4, 2, 3, 4, 3, 3, 2, 3, 4, 4, 3, 4, 3, 3, 2, 4, 3, 3, 2, 3, 2, 2, 1, 
-//     2, 3, 3, 4, 3, 4, 4, 3, 3, 4, 4, 3, 2, 3, 3, 2, 3, 4, 4, 3, 4, 3, 3, 2, 4, 3, 3, 2, 3, 2, 2, 1, 
-//     3, 4, 4, 3, 4, 3, 3, 2, 4, 3, 3, 2, 3, 2, 2, 1, 2, 3, 3, 2, 3, 2, 2, 1, 3, 2, 2, 1, 2, 1, 1, 0
-// );
-// 
-// const case_triangle_offset: array<u32> = array(...);
-// 
-// const case_triangle_number: array<u32> = array(...);
-
-// const case_triangle_edges: array<array<u32, 3>> = array(...);
-
-// const case_edges: array<u32> = array(...);
 
 @group(0) @binding(0)
 var<storage, read_write> sdf_data: array<f32>; 
@@ -60,10 +42,6 @@ fn main(
         c += triangle_count_prefix[src_idx];
     }
 
-    // ONLY FOR DEBUG THIS WRITE IS NOT NEEDED:
-    // triangle_count_prefix[gid] = c;
-    // END DEBUG WRITE
-
 
     let write_start: u32 = c + chunk.write_offset;
 
@@ -98,7 +76,10 @@ fn main(
     idx |= u32(sd[6]>0.0) << 6u;
     idx |= u32(sd[7]>0.0) << 7u;
 
-    let tris: u32 = this_u.case_to_offset[idx + 1u] - this_u.case_to_offset[idx];
+    let case_to_offset = this_u.case_to_offset[idx];
+    let case_to_offset1 = this_u.case_to_offset[idx + 1u];
+
+    let tris: u32 = case_to_offset1 - case_to_offset;
 
 
     // ________ _____ _____ _____ ___ ___ ___

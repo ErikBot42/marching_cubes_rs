@@ -6,8 +6,12 @@ use std::{
     fmt::Display,
     marker::Copy,
     mem::size_of,
+    rc::Rc,
     slice::from_ref,
-    sync::Arc,
+    sync::{
+        mpsc::{Receiver, Sender},
+        Arc, Mutex,
+    },
     time::{Duration, Instant, UNIX_EPOCH},
 };
 
@@ -79,6 +83,7 @@ struct Storage {
     trigen: TriGenState,
     data_entries_written: usize,
     indirect_draw_buffer: MetaBuffer,
+    query: Option<QuerySetState<MarkerStart>>,
 }
 impl Storage {
     fn new(device: &wgpu::Device, cube_march: &CubeMarch) -> Self {
@@ -102,10 +107,11 @@ impl Storage {
         let indirect_draw_buffer = MetaBuffer::new_uninit(
             device,
             "indirect_draw_buffer",
-            INDIRECT | COPY_DST,
+            INDIRECT | COPY_DST | STORAGE,
             32 * 1024 * 1024,
         ); // TODO: pick size
         let data_entries_written = 0;
+        let query = Some(QuerySetState::new(device));
         Self {
             b0,
             data,
@@ -120,11 +126,17 @@ impl Storage {
             capacity,
             data_entries_written,
             indirect_draw_buffer,
+            query,
         }
     }
     fn dispatch(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         let target: (u32, u32, u32) = (0, 0, 0);
-        let radius = 32;
+        let radius = 16;
+
+        self.query = self.query.take().map(|mut q| {
+            q.resolve(device, queue);
+            q
+        });
 
         if self.capacity < self.offset + MAX_TRIS_PER_CHUNK {
             return;
@@ -142,7 +154,7 @@ impl Storage {
             }
         }
 
-        for _ in 0..1 {
+        for _ in 0..32 {
             if self.capacity < self.offset + MAX_TRIS_PER_CHUNK {
                 return;
             }
@@ -181,9 +193,24 @@ impl Storage {
             self.trigen.chunk.write(queue, chunk);
 
             let mut encoder = device.create_command_encoder(&default());
-            self.trigen
-                .dispatch(&mut encoder, &self.count_staging_buffer);
+            let query = self.query.take();
+            let query = query.map(|q| q.encoder(&mut encoder));
+            let query = self
+                .trigen
+                .dispatch(&mut encoder, &self.count_staging_buffer, query);
+            let query = query.map(|q| q.encoder(&mut encoder));
+            self.query = query;
             queue.submit([encoder.finish()]); // submit needed to map buffer later.
+
+            // {
+            //     self.trigen.inspect_buffer.buffer.slice(..).map_async(wgpu::MapMode::Read, |_| ());
+            //     device.poll(wgpu::MaintainBase::Wait);
+            //     let tmp = self.trigen.inspect_buffer.buffer.slice(..).get_mapped_range();
+            //     let range: &[u32] = bytemuck::cast_slice(&tmp);
+            //     println!("{:?}", &range[1..129]);
+            //     drop(tmp);
+            //     panic!();
+            // }
 
             self.awaiting = Some((x, y, z));
             let sender = self.send.clone();
@@ -521,6 +548,7 @@ impl Kernel {
             layout: Some(&pipeline_layout),
             module: &shader_module,
             entry_point: "main",
+            compilation_options: default(),
         });
         Self {
             pipeline,
@@ -586,151 +614,13 @@ struct TriGenState {
     render_case_uniform: MetaBuffer,
     // query_buffer0: MetaBuffer,
     // query_buffer1: MetaBuffer,
+    inspect_buffer: MetaBuffer,
 }
-
-
-struct QuerySetState<T: Seq> {
-    set: wgpu::QuerySet,
-    resolve_buffer: wgpu::Buffer,
-    staging_buffer: wgpu::Buffer,
-    i: u32,
-    _phantom: std::marker::PhantomData<T>,
-}
-impl<T: Seq> QuerySetState<T> {
-    fn next(mut self) -> QuerySetState<T::Next> {
-        self.i += 1;
-        let Self {
-            set,
-            resolve_buffer,
-            staging_buffer,
-            i,
-            _phantom,
-        } = self;
-        QuerySetState {
-            set,
-            resolve_buffer,
-            staging_buffer,
-            i,
-            _phantom: std::marker::PhantomData,
-        }
-    }
-    fn new(device: &wgpu::Device) -> QuerySetState<MarkerStart> {
-        let set = device.create_query_set(&wgpu::QuerySetDescriptor {
-            label: Some("query set"),
-            ty: wgpu::QueryType::Timestamp,
-            count: wgpu::QUERY_SET_MAX_QUERIES,
-        });
-        let i = 0;
-        let size = wgpu::QUERY_SET_MAX_QUERIES as u64 * size_of::<u64>() as u64;
-
-        let resolve_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("resolve buffer"),
-            size,
-            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::QUERY_RESOLVE,
-            mapped_at_creation: false,
-        });
-        let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("resolve buffer"),
-            size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        QuerySetState::<MarkerPreCompute> {
-            set,
-            i,
-            resolve_buffer,
-            staging_buffer,
-            _phantom: std::marker::PhantomData,
-        }
-    }
-    fn pass(self, pass: &mut wgpu::ComputePass) -> QuerySetState<T::Next> {
-        pass.write_timestamp(&self.set, self.i);
-        self.next()
-    }
-    fn encoder(self, encoder: &mut wgpu::CommandEncoder) -> QuerySetState<T::Next> {
-        encoder.write_timestamp(&self.set, self.i);
-        self.next()
-    }
-}
-impl QuerySetState<MarkerStart> {
-    fn need_resolve(&self) -> bool {
-        self.i < wgpu::QUERY_SET_MAX_QUERIES / 2
-    }
-    fn resolve(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        let mut encoder = device.create_command_encoder(&default());
-        encoder.resolve_query_set(&self.set, 0..self.i, &self.resolve_buffer, 0);
-
-        let bytes = self.i as u64 * size_of::<u64>() as u64;
-
-        encoder.copy_buffer_to_buffer(&self.resolve_buffer, 0, &self.staging_buffer, 0, bytes);
-
-        self.staging_buffer
-            .slice(0..bytes)
-            .map_async(wgpu::MapMode::Read, |_| ());
-
-        queue.submit([encoder.finish()]);
-
-        device.poll(wgpu::MaintainBase::Wait);
-
-        let tmp = self.staging_buffer.slice(0..bytes).get_mapped_range();
-        let data: &[QueryRaw] = bytemuck::cast_slice(&tmp);
-
-        dbg!(data);
-
-        let seconds_per_tick = (queue.get_timestamp_period() as f64) / 1_000_000_000.0;
-
-        for d in data {
-            dbg!(d.query(seconds_per_tick));
-        }
-    }
-}
-
-trait Seq {
-    type Next: Seq;
-}
-macro_rules! seq {
-    ($query:ident $raw:ident $start:ident $($a:ident $c:ident)*) => {
-        $(struct $a;)*
-        #[repr(C)]
-        #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-        struct $raw { $($c: u64,)* }
-        #[derive(Debug)]
-        struct $query { $($c: Duration,)* }
-        seq!($start [$($a)*]);
-        seq!($query $raw ($($c)*));
-    };
-    ($query:ident $raw:ident ($a:ident $($as:ident)*)) => { seq!($query $raw ($a $($as)*), ($($as)* $a)); };
-    ($query:ident $raw:ident ($($as:ident)*), ($($bs:ident)*)) => {
-        impl $raw {
-            fn query(self, seconds_per_tick: f64) -> $query {
-                $( let $as = (self.$as as f64) * seconds_per_tick;)*
-                $query {$(
-                    $bs: Duration::from_secs_f64(($bs - $as).abs()),
-                )*}
-            }
-        }
-    };
-    ($start:ident [$a:ident $($as:ident)*]) => { 
-        type $start = $a;
-        seq!([$a $($as)*], [$($as)* $a]); 
-    };
-    ([$($as:ident)*], [$($bs:ident)*]) => { $(impl Seq for $as { type Next = $bs; })* }
-}
-
-seq!(Query2 QueryRaw MarkerStart
-    MarkerPreCompute pre_compute
-    MarkerPrePass pre_pass
-    MarkerSdf sdf
-    MarkerTriangleAllocation triangle_allocation
-    MarkerPrefixTop prefix_top
-    MarkerTriangleWriteback triangle_writeback
-    MarkerPostCompute post_compute
-);
-
 
 impl TriGenState {
     #[rustfmt::skip]
     fn new(device: &wgpu::Device, cube_march: &CubeMarch, triangle_storage: &MetaBuffer) -> Self {
+        let inspect_buffer = MetaBuffer::new_uninit(device, "inspect_buffer", COPY_DST | MAP_READ, (32*32*32 + 1) * 4);
         let sdf_data = MetaBuffer::new(device, "sdf_data", NONE, &vec![0.0_f32; 33*33*33 + 159]);
 
         let triangle_count_prefix = MetaBuffer::new(device, "triangle_count_prefix", COPY_SRC, &vec![0_u32; 32*32*32 + 1]);
@@ -745,7 +635,7 @@ impl TriGenState {
 
 
         let chunk_uniform = ChunkUniform::default();
-        let chunk_uniform = MetaBuffer::new_uniform(device, COPY_DST, &chunk_uniform);
+        let chunk_uniform = MetaBuffer::new_uniform(device, COPY_DST | STORAGE, &chunk_uniform);
 
         let tri_alloc_uniform = TriAllocUniform::new(&cube_march);
         let tri_alloc_uniform = MetaBuffer::new_constant(device, "TriAllocUniform", NONE, from_ref(&tri_alloc_uniform));
@@ -768,6 +658,7 @@ impl TriGenState {
             triangle_writeback,
             staging_buffer,
             render_case_uniform,
+            inspect_buffer,
             // query_buffer0,
             // query_buffer1,
         }
@@ -777,8 +668,9 @@ impl TriGenState {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         staging_buffer: &MetaBuffer,
+        query: Option<QuerySetState<MarkerPrePass>>,
         //mut qset: Option<&mut QuerySetState>,
-    ) {
+    ) -> Option<QuerySetState<MarkerPostCompute>> {
         // let mut encoder = device.create_command_encoder(&default());
         //encoder.write_timestamp(qset, 0);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -788,19 +680,40 @@ impl TriGenState {
         // if let Some(q) = &mut qset {
         //     q.pass(&mut pass);
         // }
+        let query = query.map(|q| q.pass(&mut pass));
         self.sdf.dispatch(&mut pass);
         // if let Some(q) = &mut qset {
         //     q.pass(&mut pass);
         // }
+        let query = query.map(|q| q.pass(&mut pass));
         self.triangle_allocation.dispatch(&mut pass);
         //if let Some(q) = &mut qset {
         //    q.pass(&mut pass);
         //}
+        // drop(pass);
+
+        // {
+        //     encoder.copy_buffer_to_buffer(
+        //         &self.triangle_count_prefix.buffer,
+        //         0,
+        //         &self.inspect_buffer.buffer,
+        //         0,
+        //         self.triangle_count_prefix.bytes,
+        //     );
+        // }
+
+        // let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        //     label: None,
+        //     timestamp_writes: None,
+        // });
+        let query = query.map(|q| q.pass(&mut pass));
         self.prefix_top.dispatch(&mut pass);
         //if let Some(q) = &mut qset {
         //    q.pass(&mut pass);
         //}
+        let query = query.map(|q| q.pass(&mut pass));
         self.triangle_writeback.dispatch(&mut pass);
+        let query = query.map(|q| q.pass(&mut pass));
         //if let Some(q) = &mut qset {
         //    q.pass(&mut pass);
         //}
@@ -815,67 +728,333 @@ impl TriGenState {
             0,
             4,
         );
-        //encoder.resolve_query_set(&qset, 0..2, &self.query_buffer0.buffer, 0);
-        //encoder.copy_buffer_to_buffer(&self.query_buffer0.buffer, 0, &self.query_buffer1.buffer, 0, 2 * std::mem::size_of::<u64>() as u64);
-        // queue.submit([encoder.finish()]);
-        //self.query_buffer1.buffer.slice(..).map_async(wgpu::MapMode::Read, |x| x.unwrap());
-        // self.staging_buffer
-        //     .buffer
-        //     .slice(..)
-        //     .map_async(wgpu::MapMode::Read, |x| x.unwrap());
-        // device.poll(wgpu::Maintain::Wait);
-        // let tmp = self
-        //     .staging_buffer
-        //     .buffer
-        //     .slice(..)
-        //     .get_mapped_range();
-        // let data: &[u32] = bytemuck::cast_slice(&tmp);
-        // //println!("Expected triangles written: {}.", data[0]);
-        // let num_tris = data[0];
-        // drop(tmp);
-        // self.staging_buffer.buffer.unmap();
-
-        //let tmp2 = self.query_buffer1.buffer.slice(..).get_mapped_range();
-        //let data2: &[u64] = bytemuck::cast_slice(&tmp2);
-
-        // let start = data2[0];
-        // let end = data2[1];
-
-        // let dur = std::time::Duration::from_secs_f64(((end - start) as f64 * queue.get_timestamp_period() as f64)*(1.0/1_000_000_000.0));
-
-        // panic!("{dur:?}");
-
-        // num_tris
+        query
     }
-    // fn inspect(&self, triangle_storage: &MetaBuffer, device: &wgpu::Device, queue: &wgpu::Queue) {
-    //     let read_buf = triangle_storage;
+}
+struct QuerySetState<T: Seq> {
+    set: wgpu::QuerySet,
+    resolve_buffer: wgpu::Buffer,
+    staging_buffer: wgpu::Buffer,
+    i: u32,
+    stats: Stats,
+    _phantom: std::marker::PhantomData<T>,
+}
+impl<T: Seq> QuerySetState<T> {
+    fn next(mut self) -> QuerySetState<T::Next> {
+        self.i += 1;
+        let Self {
+            set,
+            resolve_buffer,
+            staging_buffer,
+            i,
+            stats,
+            _phantom,
+        } = self;
+        QuerySetState {
+            set,
+            resolve_buffer,
+            staging_buffer,
+            i,
+            stats,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+    fn pass(self, pass: &mut wgpu::ComputePass) -> QuerySetState<T::Next> {
+        pass.write_timestamp(&self.set, self.i);
+        self.next()
+    }
+    fn encoder(self, encoder: &mut wgpu::CommandEncoder) -> QuerySetState<T::Next> {
+        encoder.write_timestamp(&self.set, self.i);
+        self.next()
+    }
+}
+impl QuerySetState<MarkerStart> {
+    fn new(device: &wgpu::Device) -> Self {
+        let set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("query set"),
+            ty: wgpu::QueryType::Timestamp,
+            count: wgpu::QUERY_SET_MAX_QUERIES,
+        });
+        let i = 0;
+        let size = wgpu::QUERY_SET_MAX_QUERIES as u64 * size_of::<u64>() as u64;
 
-    //     let bytes = 3000 * 4;
+        let resolve_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("resolve buffer"),
+            size,
+            usage: COPY_SRC | QUERY_RESOLVE,
+            mapped_at_creation: false,
+        });
+        let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("resolve buffer"),
+            size,
+            usage: COPY_DST | MAP_READ,
+            mapped_at_creation: false,
+        });
+        let stats = Stats::new();
+        Self {
+            set,
+            i,
+            resolve_buffer,
+            staging_buffer,
+            stats,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+    fn need_resolve(&self) -> bool {
+        self.i < wgpu::QUERY_SET_MAX_QUERIES / 2
+    }
+    fn resolve(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if self.i == 0 {
+            return;
+        }
+        let mut encoder = device.create_command_encoder(&default());
+        encoder.resolve_query_set(&self.set, 0..self.i, &self.resolve_buffer, 0);
 
-    //     let tmp_buf = MetaBuffer::new_uninit(device, "tmp dst", MAP_READ | COPY_DST, bytes);
+        let bytes = self.i as u64 * size_of::<u64>() as u64;
 
-    //     let mut encoder = device.create_command_encoder(&default());
+        encoder.copy_buffer_to_buffer(&self.resolve_buffer, 0, &self.staging_buffer, 0, bytes);
 
-    //     encoder.copy_buffer_to_buffer(&read_buf.buffer, 0, &tmp_buf.buffer, 0, bytes);
-    //     queue.submit([encoder.finish()]);
+        queue.submit([encoder.finish()]);
 
-    //     tmp_buf
-    //         .buffer
-    //         .slice(..)
-    //         .map_async(wgpu::MapMode::Read, |_| ());
-    //     device.poll(wgpu::Maintain::Wait);
+        self.staging_buffer
+            .slice(0..bytes)
+            .map_async(wgpu::MapMode::Read, |_| ());
 
-    //     let slice: &[u8] = &tmp_buf.buffer.slice(..).get_mapped_range();
+        device.poll(wgpu::MaintainBase::Wait);
 
-    //     let slice_u32: &[u32] = bytemuck::cast_slice(slice);
-    //     println!("{slice_u32:?}");
+        let tmp = self.staging_buffer.slice(0..bytes).get_mapped_range();
+        let data: &[QueryRaw] = bytemuck::cast_slice(&tmp);
 
-    //     // let diff = slice_u32.windows(2).map(|w| w[1] - w[0]).collect::<Vec<_>>();
-    //     // println!("{diff:?}");
-    //     // for c in slice_u32[1..].chunks(128) {
-    //     //     println!("{:?}", c.last());
-    //     // }
-    // }
+        //dbg!(data);
+
+        let seconds_per_tick = (queue.get_timestamp_period() as f64) / 1_000_000_000.0;
+
+        for d in data {
+            let query = d.query(seconds_per_tick);
+            self.stats.add(query);
+        }
+        drop(tmp);
+
+        self.staging_buffer.unmap();
+
+        self.i = 0;
+    }
+}
+
+trait Seq {
+    type Next: Seq;
+}
+macro_rules! seq {
+    ($query:ident $raw:ident $start:ident $($a:ident $c:ident)*) => {
+        $(struct $a;)*
+        #[repr(C)]
+        #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct $raw { $($c: u64,)* }
+        #[derive(Debug, Default, Copy, Clone)]
+        struct $query { $($c: f64,)* }
+        seq!($start [$($a)*]);
+        seq!($query $raw ($($c)*));
+        impl std::ops::AddAssign<$query> for $query { fn add_assign(&mut self, rhs: $query) { $(self.$c += rhs.$c;)* } }
+        impl std::ops::Mul<$query> for $query { type Output = $query; fn mul(self, rhs: $query) -> Self::Output { Self { $($c: self.$c * rhs.$c,)* } } }
+        impl std::ops::Div<$query> for $query { type Output = $query; fn div(self, rhs: $query) -> Self::Output { Self { $($c: self.$c / rhs.$c,)* } } }
+        impl std::ops::Add<$query> for $query { type Output = $query; fn add(self, rhs: $query) -> Self::Output { Self { $($c: self.$c + rhs.$c,)* } } }
+        impl std::ops::Sub<$query> for $query { type Output = $query; fn sub(self, rhs: $query) -> Self::Output { Self { $($c: self.$c - rhs.$c,)* } } }
+        impl std::ops::Mul<f64> for $query { type Output = $query; fn mul(self, rhs: f64) -> Self::Output { Self { $($c: self.$c * rhs,)* } } }
+        impl std::ops::Div<f64> for $query { type Output = $query; fn div(self, rhs: f64) -> Self::Output { Self { $($c: self.$c / rhs,)* } } }
+        impl std::ops::Add<f64> for $query { type Output = $query; fn add(self, rhs: f64) -> Self::Output { Self { $($c: self.$c + rhs,)* } } }
+        impl std::ops::Sub<f64> for $query { type Output = $query; fn sub(self, rhs: f64) -> Self::Output { Self { $($c: self.$c - rhs,)* } } }
+        impl $query { fn sqrt(self) -> $query { Self { $($c: self.$c.sqrt(),)* } } }
+        impl $query {
+            fn disp_mean_sd(mean: $query, sd: $query) {
+                println!("Query {{");
+                $(println!(
+                    concat!( "    ", stringify!($c), ": {:?} +- {:?}"),
+                    Duration::from_secs_f64(mean.$c),
+                    Duration::from_secs_f64(sd.$c)
+                );)*
+                println!("}}");
+            }
+        }
+    };
+    ($query:ident $raw:ident ($a:ident $($as:ident)*)) => { seq!($query $raw ($a $($as)*), ($($as)* $a)); };
+    ($query:ident $raw:ident ($($as:ident)*), ($($bs:ident)*)) => {
+        impl $raw {
+            fn query(self, seconds_per_tick: f64) -> $query {
+                $( let $as = (self.$as as f64) * seconds_per_tick;)*
+                $query {$(
+                    $bs: ($bs - $as).abs(),
+                )*}
+            }
+        }
+    };
+    ($start:ident [$a:ident $($as:ident)*]) => {
+        type $start = $a;
+        seq!([$a $($as)*], [$($as)* $a]);
+    };
+    ([$($as:ident)*], [$($bs:ident)*]) => { $(impl Seq for $as { type Next = $bs; })* }
+}
+
+#[derive(Default)]
+struct Stats {
+    samples: u64,
+    s0: u64,
+    s1: Query,
+    s2: Query,
+}
+impl Stats {
+    fn new() -> Self {
+        Self::default()
+    }
+    fn add(&mut self, query: Query) {
+        self.samples += 1;
+        if self.samples > 200 {
+            self.s0 += 1;
+            self.s1 += query;
+            self.s2 += query * query;
+        }
+    }
+    fn display(&self) {
+        let Self {
+            s0,
+            s1,
+            s2,
+            samples: _,
+        } = *self;
+        if s0 < 5 {
+            return;
+        }
+        let s0 = s0 as f64;
+        let mean = s1 / s0;
+        let sd = ((s2 * s0 - s1 * s1) / (s0 * (s0 - 1.0))).sqrt();
+        Query::disp_mean_sd(mean, sd);
+    }
+}
+seq!(Query QueryRaw MarkerStart
+    MarkerPreCompute pre_compute
+    MarkerPrePass pre_pass
+    MarkerSdf sdf
+    MarkerTriangleAllocation triangle_allocation
+    MarkerPrefixTop prefix_top
+    MarkerTriangleWriteback triangle_writeback
+    MarkerPostCompute post_compute
+);
+
+// copy -> map_async
+//
+// draw
+//
+// resolve
+// map_get
+// unmap
+
+// copy_map_async();
+//
+// begin();
+//
+// render();
+//
+// end();
+//
+// if ... { take(); }
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct RawRenderQuery {
+    vertex_shader_invocations: u64,
+    clipper_invocations: u64,
+    clipper_primitives_out: u64,
+    fragment_shader_invocations: u64,
+}
+
+// wgpu call -> DynContext -> Context ->
+
+struct RenderQueryState {
+    qset: wgpu::QuerySet,
+    staging: Arc<wgpu::Buffer>,
+    resolve: wgpu::Buffer,
+    mtx: Arc<Mutex<Option<RawRenderQuery>>>,
+    should_query: bool,
+}
+impl RenderQueryState {
+    fn new(device: &wgpu::Device) -> Self {
+        let qset = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("render query set"),
+            ty: wgpu::QueryType::PipelineStatistics(
+                wgpu::PipelineStatisticsTypes::VERTEX_SHADER_INVOCATIONS
+                    | wgpu::PipelineStatisticsTypes::CLIPPER_INVOCATIONS
+                    | wgpu::PipelineStatisticsTypes::CLIPPER_PRIMITIVES_OUT
+                    | wgpu::PipelineStatisticsTypes::FRAGMENT_SHADER_INVOCATIONS,
+            ),
+            count: 1,
+        });
+        let size = size_of::<RawRenderQuery>() as u64;
+        let staging = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("render query staging buffer"),
+            size,
+            usage: MAP_READ | COPY_DST,
+            mapped_at_creation: false,
+        }));
+        let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("render query resolve buffer"),
+            size,
+            usage: COPY_SRC | QUERY_RESOLVE,
+            mapped_at_creation: false,
+        });
+        let mtx = Arc::new(Mutex::new(None));
+        let should_query = true;
+        Self {
+            qset,
+            staging,
+            resolve,
+            mtx,
+            should_query,
+        }
+    }
+    fn begin(&mut self, pass: &mut wgpu::RenderPass) {
+        if self.should_query {
+            pass.begin_pipeline_statistics_query(&self.qset, 0);
+        }
+    }
+    fn end(&mut self, pass: &mut wgpu::RenderPass) {
+        if self.should_query {
+            pass.end_pipeline_statistics_query();
+        }
+    }
+    fn copy_map_async(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if self.should_query {
+            let mut encoder = device.create_command_encoder(&default());
+            encoder.copy_buffer_to_buffer(
+                &self.resolve,
+                0,
+                &self.staging,
+                0,
+                size_of::<RawRenderQuery>() as u64,
+            );
+            queue.submit([encoder.finish()]);
+            let staging_clone = Arc::clone(&self.staging);
+            let mtx = self.mtx.clone();
+            self.staging
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |r| {
+                    r.unwrap();
+                    let res: RawRenderQuery = {
+                        let tmp = staging_clone.slice(..).get_mapped_range();
+                        let res: &[RawRenderQuery] = bytemuck::cast_slice(&tmp);
+                        res[0]
+                    };
+                    staging_clone.unmap();
+                    *mtx.lock().unwrap() = Some(res);
+                });
+            self.should_query = false;
+        }
+    }
+    fn take(&mut self) -> Option<RawRenderQuery> {
+        let tmp = self.mtx.lock().unwrap().take();
+        if tmp.is_some() {
+            self.should_query = true;
+        }
+        tmp
+    }
 }
 
 fn cmap<U: Copy, V: Copy, const N: usize>(a: [U; N], f: fn(U) -> V, v_default: V) -> [V; N] {
@@ -985,8 +1164,8 @@ impl Camera {
             up: cgmath::Vector3::unit_y(),
             aspect: surface_config.width as f32 / surface_config.height as f32,
             fovy: 45.0,
-            znear: 0.1,
-            zfar: 100.0,
+            znear: 0.9,
+            zfar: 10.0,//100.0,
         }
     }
 }
@@ -998,6 +1177,7 @@ struct Texture {
 }
 impl Texture {
     const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+    //const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth16Unorm;
     fn new_depth(device: &wgpu::Device, surface_config: &wgpu::SurfaceConfiguration) -> Self {
         let size = wgpu::Extent3d {
             width: surface_config.width,
@@ -1130,6 +1310,7 @@ impl UpdateRenderPipeline {
                 module: &shader_module,
                 entry_point: "vs_main",
                 buffers: &[vertex_buffer_layout],
+                compilation_options: default(),
             },
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
@@ -1160,6 +1341,7 @@ impl UpdateRenderPipeline {
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
+                compilation_options: default(),
             }),
             multiview: None,
         });
@@ -1321,7 +1503,7 @@ impl<'a> State<'a> {
     fn new(window: &'a winit::window::Window) -> Self {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
-            flags: wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER,
+            flags: default(), //wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER,
             // | wgpu::InstanceFlags::DEBUG
             // | wgpu::InstanceFlags::VALIDATION
             dx12_shader_compiler: default(),
@@ -1349,6 +1531,7 @@ impl<'a> State<'a> {
             .unwrap_or(surface_caps.formats[0]);
 
         dbg!(adapter.features());
+        dbg!(!adapter.features());
         dbg!(adapter.get_info());
 
         let mut required_limits = wgpu::Limits::downlevel_defaults();
@@ -1363,7 +1546,10 @@ impl<'a> State<'a> {
                     required_features: wgpu::Features::MULTI_DRAW_INDIRECT
                         | wgpu::Features::INDIRECT_FIRST_INSTANCE
                         | wgpu::Features::TIMESTAMP_QUERY
-                        | wgpu::Features::VERTEX_WRITABLE_STORAGE, // TODO: omit
+                        | wgpu::Features::VERTEX_WRITABLE_STORAGE // TODO: omit
+                        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES
+                        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
+                        | wgpu::Features::SUBGROUP,
                     required_limits,
                 },
                 None,
@@ -1466,7 +1652,7 @@ impl<'a> State<'a> {
         // );
         let cubemarch = CubeMarch::new();
         let storage = Storage::new(&device, &cubemarch);
-        let triangle_storage = &storage.b0;
+        // let triangle_storage = &storage.b0;
         // let trigen_state = TriGenState::new(&device, &cubemarch, &triangle_storage);
 
         let bitpack_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1510,16 +1696,6 @@ impl<'a> State<'a> {
             attributes: &wgpu::vertex_attr_array![0 => Uint32],
         };
 
-        let bitpack_shader_module = create_shader_module(
-            &device,
-            wgpu::ShaderModuleDescriptor {
-                label: Some(source!("chunk_draw").0),
-                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
-                    source!("chunk_draw").1,
-                )),
-            },
-        );
-
         let bitpack_render_pipeline = UpdateRenderPipeline::new(
             &device,
             bitpack_pipeline_layout,
@@ -1527,57 +1703,6 @@ impl<'a> State<'a> {
             surface_config.format,
             source!("chunk_draw"),
         );
-        // let bitpack_render_pipeline =
-        //     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        //         label: Some("bitpack_render_pipeline"),
-        //         layout: Some(&bitpack_pipeline_layout),
-        //         vertex: wgpu::VertexState {
-        //             module: &bitpack_shader_module,
-        //             entry_point: "vs_main",
-        //             buffers: &[bitpack_vertex_buffer_layout],
-        //         },
-        //         primitive: wgpu::PrimitiveState {
-        //             topology: wgpu::PrimitiveTopology::TriangleList,
-        //             strip_index_format: None,
-        //             front_face: wgpu::FrontFace::Ccw,
-        //             cull_mode: None,
-        //             unclipped_depth: false,
-        //             polygon_mode: wgpu::PolygonMode::Fill,
-        //             conservative: false,
-        //         },
-        //         depth_stencil: Some(wgpu::DepthStencilState {
-        //             format: Texture::DEPTH_FORMAT,
-        //             depth_write_enabled: true,
-        //             depth_compare: wgpu::CompareFunction::Less,
-        //             stencil: wgpu::StencilState::default(),
-        //             bias: wgpu::DepthBiasState::default(),
-        //         }),
-        //         multisample: wgpu::MultisampleState {
-        //             count: 1,
-        //             mask: !0,
-        //             alpha_to_coverage_enabled: false,
-        //         },
-        //         fragment: Some(wgpu::FragmentState {
-        //             module: &bitpack_shader_module,
-        //             entry_point: "fs_main",
-        //             targets: &[Some(wgpu::ColorTargetState {
-        //                 format: surface_config.format,
-        //                 blend: Some(wgpu::BlendState::REPLACE),
-        //                 write_mask: wgpu::ColorWrites::ALL,
-        //             })],
-        //         }),
-        //         multiview: None,
-        //     });
-
-        // let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
-        //     label: Some("query_set"),
-        //     ty: wgpu::QueryType::Timestamp,
-        //     count: 2,
-        // });
-
-        // let num_bitpack_tris = trigen_state.dispatch(&device, &queue);
-
-        // trigen_state.inspect(&triangle_storage, &device, &queue);
 
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: None,
@@ -1586,6 +1711,7 @@ impl<'a> State<'a> {
                 module: &shader_module,
                 entry_point: "vs_main",
                 buffers: &[vertex_buffer_layout],
+                compilation_options: default(),
             },
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
@@ -1616,6 +1742,7 @@ impl<'a> State<'a> {
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
+                compilation_options: default(),
             }),
             multiview: None,
         });
@@ -1646,39 +1773,7 @@ impl<'a> State<'a> {
         let view = &output.texture.create_view(&default());
         let mut encoder = self.device.create_command_encoder(&default());
         self.storage.dispatch(&self.device, &self.queue);
-        if false {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: None,
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.2,
-                            b: 0.3,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_texture.view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-
-            render_pass.draw(0..self.num_vert, 0..1);
-        } else {
+        {
             let pipeline = self.bitpack_render_pipeline.get(&self.device);
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
@@ -1715,7 +1810,7 @@ impl<'a> State<'a> {
             // render_pass.draw(0..3, 0..self.num_bitpack_tris);
         }
         self.camera = Camera::new(&self.surface_config);
-        let t = self.t0.elapsed().as_secs_f32();
+        let t = 0.0_f32;//self.t0.elapsed().as_secs_f32();
         self.camera.eye = (
             2.0 * t.sin(),
             (t * 2.0_f32.sqrt() * 0.5).sin() * 0.1,
@@ -1739,6 +1834,10 @@ impl<'a> State<'a> {
                 self.storage.offset as f64 / 1_000_000.0,
                 self.storage.data.len(),
             );
+            if let Some(ref q) = self.storage.query {
+                q.stats.display();
+
+            }
 
             self.last_count = 0;
             self.last_time = Instant::now();
@@ -1785,6 +1884,8 @@ fn main() {
                         }
                         WindowEvent::Resized(size) => {
                             state.resize(size);
+                        }
+                        WindowEvent::KeyboardInput { device_id, event, is_synthetic } => {
                         }
                         _ => (),
                     }

@@ -21,7 +21,8 @@ version = "0.11.3"
 #default-features = false
 
 [dependencies.wgpu]
-version = "0.19.3"
+#version = "0.19.3"
+version = "0.20.0"
 features = ["wgsl"]
 default-features = false
 
