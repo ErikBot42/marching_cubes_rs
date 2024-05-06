@@ -7,10 +7,13 @@ struct TriAllocUniform {
 var<storage, read> this_u: TriAllocUniform;
 
 @group(0) @binding(1)
-var<storage, read_write> sdf_data: array<f32>; 
+var<storage, read> sdf_data: array<f32>; 
 
 @group(0) @binding(2)
 var<storage, read_write> triangle_count_prefix: array<u32>; 
+
+// @group(0) @binding(3)
+// var<storage, read_write> something_unused: array<u32>; 
 
 // var<workgroup> wg0: array<u32, 128>;
 // var<workgroup> wg1: array<u32, 128>;

@@ -1,4 +1,6 @@
-use std::{array, collections::{HashMap, VecDeque}};
+use std::{
+    array, collections::{HashMap, VecDeque}, fmt::Debug, mem::replace
+};
 trait SearchExt<T: Copy + Eq> {
     fn indexof(self, t: T) -> usize;
 }
@@ -112,86 +114,123 @@ fn gen_cases() -> Box<CubeMarch> {
     // created manually from the cases presented on wikipedia
     #[rustfmt::skip]
     let cases = [
-        (0, 0, vec![]),
-        (1, t2, vec![[s02, s23, s26]]),
-        (2, t2|t3, vec![[s02, s13, s26], [s26, s37, s13]]),
-        (3, t2|t7, vec![[s02, s23, s26], [s67, s57, s37]]),
-        (4, t0|t1|t3, vec![[s02, s23, s37], [s02, s04, s37], [s04, s15, s37]]),
+        (0, vec![]),
+        (t2, vec![[s02, s23, s26]]),
+        (t2|t3, vec![[s02, s13, s26], [s26, s37, s13]]),
+        (t2|t7, vec![[s02, s23, s26], [s67, s57, s37]]),
+        (t0|t1|t3, vec![[s02, s23, s37], [s02, s04, s37], [s04, s15, s37]]),
+        //---
+        (t0|t1|t2|t3, vec![[s04, s15, s26], [s15, s37, s26]]),
+        (t6|t0|t1|t3, vec![[s46, s67, s26], [s04, s15, s37], [s37, s04, s02], [s23, s37, s02]]),
+        (t4|t7|t2|t1, vec![[s02, s23, s26], [s46, s45, s04], [s67, s57, s37], [s01, s13, s15]]),
+        (t4|t1|t0|t2, vec![[s45, s46, s26], [s26, s45, s23], [s45, s15, s23], [s15, s13, s23]]),
+        (t4|t0|t1|t3, vec![[s45, s15, s46], [s46, s15, s23], [s46, s23, s02], [s23, s15, s37]]),
+        //---
+        (t2|t5, vec![[s45, s15, s57], [s02, s23, s26]]),
+        (t2|t3|t5, vec![[s45, s15, s57], [s02, s13, s26], [s13, s26, s37]]),
+        (t6|t5|t3, vec![[s46, s67, s26], [s15, s57, s45], [s37, s13, s23]]),
+        (t2|t6|t1|t5, vec![[s46, s02, s23], [s46, s67, s23], [s45, s57, s13], [s01, s13, s45]]),
+        (t1|t5|t2|t0, vec![[s45, s57, s04], [s26, s23, s04], [s04, s57, s23], [s13, s23, s57]]),
         // ----
-        (5, t0|t1|t2|t3, vec![[s04, s15, s26], [s15, s37, s26]]),
-        (6, t6|t0|t1|t3, vec![[s46, s67, s26], [s04, s15, s37], [s37, s04, s02], [s23, s37, s02]]),
-        (7, t4|t7|t2|t1, vec![[s02, s23, s26], [s46, s45, s04], [s67, s57, s37], [s01, s13, s15]]),
-        (8, t4|t1|t0|t2, vec![[s45, s46, s26], [s26, s45, s23], [s45, s15, s23], [s15, s13, s23]]),
-        (9, t4|t0|t1|t3, vec![[s45, s15, s46], [s46, s15, s23], [s46, s23, s02], [s23, s15, s37]]),
-        // ----
-        (10, t2|t5, vec![[s45, s15, s57], [s02, s23, s26]]),
-        (11, t2|t3|t5, vec![[s45, s15, s57], [s02, s13, s26], [s13, s26, s37]]),
-        (12, t6|t5|t3, vec![[s46, s67, s26], [s15, s57, s45], [s37, s13, s23]]),
-        (13, t2|t6|t1|t5, vec![[s46, s02, s23], [s46, s67, s23], [s45, s57, s13], [s01, s13, s45]]),
-        (14, t1|t5|t2|t0, vec![[s45, s57, s04], [s26, s23, s04], [s04, s57, s23], [s13, s23, s57]]),
+        // https://www.boristhebrave.com/2018/04/15/marching-cubes-3d-tutorial/
+        (t6|t0|t2|t3|t5, vec![[s45, s57, s15], [s46, s04, s01], [s46, s67, s01], [s01, s13, s67], [s37, s13, s67]]),
+        (t2|t3|t4|t5|t6, vec![[s57, s15, s67], [s15, s67, s04], [s04, s67, s02], [s02, s67, s13], [s13, s37, s67]]),
+        (t1|t2|t3|t4|t6|t7, vec![[s04, s02, s45], [s45, s57, s02], [s57, s15, s02], [s15, s01, s02]]),
     ];
-    let mut front: VecDeque<_> = cases.into_iter().collect();
 
     let mut found: [_; 256] = std::array::from_fn(|_| None);
 
-    // let mut vcount: HashMap<usize, usize> = HashMap::new();
+    if true {
+        for (i, c) in cases.iter() {
+            found[*i] = Some(c.clone());
+        }
+        let mut progress = false;
+        loop {
+            for transform in transforms {
+                for i in 0..256 {
+                    let Some(c) = &found[i] else {
+                        continue;
+                    };
+                    let mut j = 0;
+                    for bit in 0..8 {
+                        let mask = 1 << bit;
+                        if i & mask != 0 {
+                            j |= 1 << transform[bit];
+                        }
+                    }
+                    if found[j].is_some() {
+                        continue;
+                    }
 
-    while let Some((vv, i, c)) = front.pop_front() {
-        for transform in transforms {
-            let mut j = 0;
-            for bit in 0..8 {
-                let mask = 1 << bit;
-                if i & mask != 0 {
-                    j |= 1 << transform[bit];
+                    let c: Vec<_> = c
+                        .iter()
+                        .copied()
+                        .map(|tri| {
+                            tri.map(|edge_vertex| {
+                                let mut transformed =
+                                    EDGES[edge_vertex].map(|vertex| transform[vertex]);
+                                transformed.sort();
+                                EDGES.indexof(transformed)
+                            })
+                        })
+                        .collect();
+
+                    found[j] = Some(c);
+                    progress = true;
                 }
             }
-            for j in [j, j ^ 255] {
-                if found[j].is_some() || i == j {
-                    continue;
-                }
-                let c: Vec<_> = c
-                    .iter()
-                    .map(|tri| {
-                        tri.map(|edge_vertex| {
-                            let mut transformed =
-                                EDGES[edge_vertex].map(|vertex| transform[vertex]);
-                            transformed.sort();
-                            EDGES.indexof(transformed)
-                        })
-                    })
-                    .collect();
-                front.push_back((vv, j, c));
+            if !replace(&mut progress, false) {
+                break;
             }
         }
-        // if found[i].is_none() {
-        //     *vcount.entry(vv).or_default() += 1;
-        // }
-        found[i] = Some(c);
+        for i in 0..256 {
+            let j = i ^ 255;
+            if found[j].is_none() {
+                dbg!(j);
+                found[j] = found[i].clone();
+            }
+        }
     }
-    // let mut vcount = vcount.into_iter().collect::<Vec<_>>();
-    // vcount.sort();
-    // panic!("{vcount:?}");
-    // let found: [Vec<_>; 256] = found.map(|f| {
-    //     f.unwrap()
-    //         .into_iter()
-    //         .map(|v| {
-    //             v.map(|i| {
-    //                 let [[ax, ay, az], [bx, by, bz]] = EDGES[i].map(|s| VERTS[s].map(|v| v as f32));
-    //                 [ax + bx, ay + by, az + bz].map(|e| e * 0.5)
-    //             })
-    //         })
-    //         .collect()
-    // });
+
+
+    if false {
+        let mut front: VecDeque<_> = cases.into_iter().collect();
+
+        while let Some((i, c)) = front.pop_front() {
+            for transform in transforms {
+                let mut j = 0;
+                for bit in 0..8 {
+                    let mask = 1 << bit;
+                    if i & mask != 0 {
+                        j |= 1 << transform[bit];
+                    }
+                }
+                for j in [j, j ^ 255] {
+                    if found[j].is_some() || i == j {
+                        continue;
+                    }
+                    let c: Vec<_> = c
+                        .iter()
+                        .map(|tri| {
+                            tri.map(|edge_vertex| {
+                                let mut transformed =
+                                    EDGES[edge_vertex].map(|vertex| transform[vertex]);
+                                transformed.sort();
+                                EDGES.indexof(transformed)
+                            })
+                        })
+                        .collect();
+                    front.push_back((j, c));
+                }
+            }
+            found[i] = Some(c);
+        }
+    }
     let found = found.map(|f| {
         let mut f = f.unwrap();
         f.iter_mut().for_each(|f| f.sort());
         f
     });
-    // println!("{:?}", &found);
-    // println!("{:?}", found.clone().map(|f| f.len()));
-    let flattened: Vec<_> = found.iter().cloned().flatten().collect();
-    // println!("{:?}", &flattened);
-    // println!("{:?}", flattened.len());
     let triangle_to_edge = {
         let mut f: Vec<_> = found.iter().flatten().copied().collect();
         f.sort();
@@ -225,10 +264,10 @@ fn gen_cases() -> Box<CubeMarch> {
     })
 }
 
-fn collect_arr<const N: usize, T>(mut i: impl Iterator<Item = T>) -> [T; N] {
-    let arr = std::array::from_fn(|_| i.next().unwrap());
-    assert!(i.next().is_none());
-    arr
+fn collect_arr<const N: usize, T: Debug>(i: impl Iterator<Item = T>) -> [T; N] {
+    let arr: Vec<_> = i.collect();
+    dbg!(arr.len(), N);
+    arr.try_into().unwrap()
 }
 
 /// All the LUTs for cube maching.
@@ -239,9 +278,9 @@ pub(crate) struct CubeMarch {
     // case -> offset
     pub(crate) case_to_offset: [usize; 257],
     // offsets -> triangle
-    pub(crate) offset_to_triangle: [usize; 732],
+    pub(crate) offset_to_triangle: [usize; 820], // 732
     // triangle -> 3*edge.
-    pub(crate) triangle_to_edge: [[usize; 3]; 135],
+    pub(crate) triangle_to_edge: [[usize; 3]; 188], // 135
     // edge -> 2*vertex.
     pub(crate) edge_to_corner: [[usize; 2]; 12],
     // vertex -> normalized position.
@@ -340,4 +379,3 @@ pub(crate) fn cube_march_cpu() -> Vec<[[f32; 3]; 3]> {
     dbg!(tris.len());
     tris
 }
-

@@ -8,23 +8,25 @@ struct VertexInput {
 struct VertexOutput {
     // (x, y, z, w) -> (x/w, y/w, z/w)
     @builtin(position) clip_position: vec4<f32>,
-    @location(0) view_pos: vec3<f32>,
-    @location(1) world_pos: vec3<f32>,
-    @location(2) dbg: vec3<f32>,
+    @location(0) world_pos: vec3<f32>,
 };
 
 struct CameraUniform {
-    view: mat4x4<f32>,
-    view_proj: mat4x4<f32>,
-    lmap: mat4x4<f32>,
-    lmap_inv: mat4x4<f32>,
+    view: mat4x4<f32>, // world, view
+    view_proj: mat4x4<f32>, // world, clip
+    lmap: mat4x4<f32>, // world, light
+    lmap_inv: mat4x4<f32>, // light, world
+    time: f32,
+    _unused0: f32,
+    _unused1: f32,
+    _unused2: f32,
 };
 @group(0) @binding(0)
 var<uniform> camera: CameraUniform;
 
 
 @group(0) @binding(1)
-var<storage, read_write> render_case: array<u32>; 
+var<storage, read> render_case: array<u32>; 
 
 @vertex
 fn vs_main(
@@ -50,17 +52,12 @@ fn vs_main(
 
     let c = vec3<u32>(x, y, z) * 2 * 7 + pos0 + pos1;
 
-    let pos = (vec3<f32>(c)/7.0 - 32.0) * (1.0 / 32.0) + pos_offset;
+    let pos = (vec3<f32>(c)/7.0) * (1.0 / 32.0) + pos_offset;
 
     var out: VertexOutput;
+
     out.clip_position = camera.view_proj * vec4<f32>(pos, 1.0);
     out.world_pos = pos;
-    out.view_pos = (camera.view * vec4<f32>(pos, 1.0)).xyz;
-    out.dbg = vec3<f32>(
-        f32((data.mask >> 8) & 255) / 255.0,
-        f32((data.mask >> 16) & 255) / 255.0,
-        f32((data.mask >> 24) & 255) / 255.0,
-    );
     return out;
 }
 
@@ -76,51 +73,42 @@ fn vs_main(
 // screen space
 
 @fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+fn fs_wire(in: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+}
 
-    let view_pos_dx = dpdx(in.view_pos);
-    let view_pos_dy = dpdy(in.view_pos);
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let r = 4.0;
+
+    let world_view = camera.view;
+    let world_light = camera.lmap;
+    let light_world = camera.lmap_inv;
+
+    let p_world = in.world_pos + camera.time * 0.1;
+    let p_view = (world_view * vec4f(p_world, 1.0)).xyz;
+    let p_light = (world_light * vec4f(p_world, 1.0)).xyz;
+    let l_light = (floor(p_light / r) + 0.5) * r;
+
+    let l_view = (world_view * (light_world * vec4<f32>(l_light, 1.0))).xyz;
+    let lp_view = l_view - p_view;
+
+    let light_strength = max(1.0 / dot(lp_view, lp_view) - 4.0 / (r * r), 0.0);
+    let lp_view_norm = normalize(lp_view);
+    let view_dir = normalize(-p_view); 
+
+    let view_pos_dx = dpdx(p_view);
+    let view_pos_dy = dpdy(p_view);
     let normal = -normalize(cross(view_pos_dx, view_pos_dy));
 
-
-    let radius = 4.0;
-
-    let lmap = camera.lmap;   
-    let light_space_pos = (lmap * vec4<f32>(in.world_pos, 1.0)).xyz;
-
-
-    let light_space_light_pos = (floor(light_space_pos/radius)+0.5)*radius;
-
-    let light_pos = (camera.view * (camera.lmap_inv * vec4<f32>(light_space_light_pos, 1.0))).xyz;
-
-    // let light_pos_world = (floor((lmap * in.world_pos)/radius)+0.5)*radius;
-
-    // let light_pos = (camera.view * vec4<f32>(light_pos_world, 1.0)).xyz;
-
-    let light_vector = light_pos - in.view_pos;
-
-    let light_dist = length(light_vector);
-
-    let light_strength = max((1.0 / (light_dist * light_dist) - 4.0 / (radius * radius)) - 0.0, 0.0);
-
-    let light_dir = normalize(light_vector);
-
-    let view_dir = normalize(-in.view_pos); 
-
-    let lambertian = max(dot(light_dir, normal), 0.0);
-
-    let h = normalize(light_dir + view_dir);
-
+    let lambertian = max(dot(lp_view_norm, normal), 0.0);
+    let h = normalize(lp_view_norm + view_dir);
     let spec_angle = max(dot(h, normal), 0.0);
-
     let specular = pow(spec_angle, 10.0);
-
-
     let color = 0.003 + lambertian * light_strength;
-
     
     // return vec4<f32>((light_pos_world + 1.0) % 0.9, 1.0);
 
-    return vec4<f32>(color, 0.0*dot(light_dir, normal), 0.0, 1.0);
+    return vec4<f32>(color, 1.0/length(p_view), 0.0, 1.0);
 }
 

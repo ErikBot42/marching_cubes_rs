@@ -1,9 +1,9 @@
 
 @group(0) @binding(0)
-var<storage, read_write> sdf_data: array<f32>; 
+var<storage, read> sdf_data: array<f32>; 
 
 @group(0) @binding(1)
-var<storage, read_write> triangle_count_prefix: array<u32>; 
+var<storage, read> triangle_count_prefix: array<u32>; 
 
 @group(0) @binding(2)
 var<storage, read_write> triangle_storage: array<u32>; 
@@ -20,7 +20,7 @@ struct Chunk {
 }
 
 struct TriWriteBackUniform {
-    offset_to_bitpack: array<u32, 732>,
+    offset_to_bitpack: array<u32, 820>, // 732
     case_to_offset: array<u32, 257>,
     _unused0: u32,
     _unused1: u32,
