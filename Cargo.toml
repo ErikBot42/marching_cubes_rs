@@ -7,6 +7,13 @@ edition = "2021"
 
 [dependencies]
 
+[dependencies.egui-wgpu]
+version = "0.27.2"
+features = ["winit", "wayland", "x11"]
+
+[dependencies.egui]
+version = "0.27.2"
+
 [dependencies.bytemuck]
 version = "1.15.0"
 features = ["derive"]
@@ -18,7 +25,8 @@ default-features = false
 
 [dependencies.env_logger]
 version = "0.11.3"
-#default-features = false
+features = ["color"]
+default-features = false
 
 [dependencies.wgpu]
 #version = "0.19.3"

@@ -21,16 +21,20 @@ fn sdf(x0: i32, y0: i32, z0: i32) -> f32 {
 
     } else if l < 1.15 {
         return -sd_mandelbulb3(p);
-    } else if l < 1.15 * f {
-        return sd_mandelbulb3(p/f);
-    } else if l < 1.15 * f * f {
-        return -sd_mandelbulb3(p/f/f);
-    } else if l < 1.15 * f * f * f {
-        return sd_mandelbulb3(p/f/f/f);
-    } else if l < 1.15 * f * f * f * f {
-        return -sd_mandelbulb3(p/f/f/f/f);
-    } else if l < 1.15 * f * f * f * f * f {
-        return sd_mandelbulb3(p/f/f/f/f/f);
+    } else if l < 1.15 *       f {
+        return  sd_mandelbulb3(p / f);
+    } else if l < 1.15 *       f * f {
+        return -sd_mandelbulb3(p / f / f);
+    } else if l < 1.15 *       f * f * f {
+        return  sd_mandelbulb3(p / f / f / f);
+    } else if l < 1.15 *       f * f * f * f {
+        return -sd_mandelbulb3(p / f / f / f / f);
+    } else if l < 1.15 *       f * f * f * f * f {
+        return  sd_mandelbulb3(p / f / f / f / f / f);
+    } else if l < 1.15 *       f * f * f * f * f * f {
+        return -sd_mandelbulb3(p / f / f / f / f / f / f);
+    } else if l < 1.15 *       f * f * f * f * f * f * f{
+        return  sd_mandelbulb3(p / f / f / f / f / f / f / f);
     } else {
 
     }
@@ -40,7 +44,7 @@ fn sdf(x0: i32, y0: i32, z0: i32) -> f32 {
 }
 
 fn sd_mandelbulb3(p: vec3<f32>) -> f32 {
-    let iterations = 6;
+    let iterations = 8;
     let power = 8.0;
 
     let half_power = (power - 1.0) * 0.5;

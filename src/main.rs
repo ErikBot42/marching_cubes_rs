@@ -64,8 +64,10 @@ macro_rules! source {
 mod cull {
     // https://gdbooks.gitbooks.io/3dcollisions/content/Chapter6/frustum.html
     use super::*;
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
     struct Plane {
-        n: Vector3<f32>,
+        n: [f32; 3],
         d: f32,
     }
     impl Plane {
@@ -77,19 +79,21 @@ mod cull {
             // ASSUME: v is normalized
 
             Self {
-                n: v / m2,
+                n: (v / m2).into(),
                 d: w / m2.sqrt(),
             }
         }
         fn outside(&self, p: Vector3<f32>) -> bool {
-            dot(self.n, p) > self.d
+            dot(self.n.into(), p) > self.d
         }
     }
-    struct Frustrum([Plane; 6]);
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+    pub(crate) struct Frustrum([Plane; 6]);
     impl Frustrum {
         // TODO: constrain far plane for distance culling.
         // need OpenGl view-projection matrix
-        fn new(view_proj: Matrix4<f32>) -> Self {
+        pub(crate) fn new(view_proj: Matrix4<f32>) -> Self {
             let m = view_proj.transpose();
             Self(
                 [
@@ -116,6 +120,7 @@ mod cull {
         }
     }
 }
+use cull::Frustrum;
 
 // MSB                          LSB
 // 00000000000000000000000000000000
@@ -185,9 +190,10 @@ struct Storage {
     indirect_draw_buffer: MetaBuffer,
     culled_indirect_draw_buffer: MetaBuffer,
     query: Option<QuerySetState<MarkerStart>>,
+    cull_kernel: Kernel,
 }
 impl Storage {
-    fn new(device: &wgpu::Device, cube_march: &CubeMarch) -> Self {
+    fn new(device: &wgpu::Device, cube_march: &CubeMarch, camera_buffer: &MetaBuffer) -> Self {
         let (send, recv) = std::sync::mpsc::channel();
         // 128 MiB = 134 million triangles
         let capacity: u32 = 32 * 1024 * 1024;
@@ -223,7 +229,11 @@ impl Storage {
         let cull_kernel = Kernel::new(
             device,
             source!("cull"),
-            &mut_map!((&indirect_draw_buffer), (&mut culled_indirect_draw_buffer)),
+            &mut_map!(
+                (camera_buffer),
+                (&indirect_draw_buffer),
+                (&mut culled_indirect_draw_buffer)
+            ),
             0,
         );
 
@@ -245,6 +255,7 @@ impl Storage {
             indirect_draw_buffer,
             query,
             culled_indirect_draw_buffer,
+            cull_kernel,
         }
     }
     fn dispatch(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, pos: Point3<f32>) {
@@ -345,71 +356,50 @@ impl Storage {
         }
 
         if self.data_entries_written < self.data.len() {
-            let should_rewrite = true;
-            if should_rewrite {
-                let range = &self.data[0..self.data.len()];
-                let to_write: Vec<DrawIndirectArgs2> = range
-                    .into_iter()
-                    .map(
-                        |&DataEntry {
-                             offset,
-                             count,
-                             x,
-                             y,
-                             z,
-                         }| {
-                            let encoded = vertex_encode(x, y, z);
-                            wgpu::util::DrawIndirectArgs {
-                                vertex_count: 3,
-                                instance_count: count,
-                                first_vertex: encoded,
-                                first_instance: offset,
-                            }
-                            .into()
-                        },
-                    )
-                    .collect();
+            let range = &self.data[self.data_entries_written..self.data.len()];
+            let to_write: Vec<DrawIndirectArgs2> = range
+                .into_iter()
+                .map(
+                    |&DataEntry {
+                         offset,
+                         count,
+                         x,
+                         y,
+                         z,
+                     }| {
+                        let encoded = vertex_encode(x, y, z);
+                        wgpu::util::DrawIndirectArgs {
+                            vertex_count: 3,
+                            instance_count: count,
+                            first_vertex: encoded,
+                            first_instance: offset,
+                        }
+                        .into()
+                    },
+                )
+                .collect();
 
-                queue.write_buffer(
-                    &self.indirect_draw_buffer.buffer,
-                    0,
-                    bytemuck::cast_slice(&to_write),
-                );
-                self.data_entries_written = self.data.len();
-            } else {
-                let range = &self.data[self.data_entries_written..self.data.len()];
-                let to_write: Vec<DrawIndirectArgs2> = range
-                    .into_iter()
-                    .map(
-                        |&DataEntry {
-                             offset,
-                             count,
-                             x,
-                             y,
-                             z,
-                         }| {
-                            let encoded = vertex_encode(x, y, z);
-                            wgpu::util::DrawIndirectArgs {
-                                vertex_count: 3,
-                                instance_count: count,
-                                first_vertex: encoded,
-                                first_instance: offset,
-                            }
-                            .into()
-                        },
-                    )
-                    .collect();
-
-                queue.write_buffer(
-                    &self.indirect_draw_buffer.buffer,
-                    (self.data_entries_written * size_of::<wgpu::util::DrawIndirectArgs>()) as u64,
-                    bytemuck::cast_slice(&to_write),
-                );
-                self.data_entries_written = self.data.len();
-            }
+            queue.write_buffer(
+                &self.indirect_draw_buffer.buffer,
+                (self.data_entries_written * size_of::<wgpu::util::DrawIndirectArgs>()) as u64,
+                bytemuck::cast_slice(&to_write),
+            );
+            self.data_entries_written = self.data.len();
         }
     }
-    fn draw<'this, 'pass>(&'this mut self, pass: &mut wgpu::RenderPass<'pass>)
+    fn cull(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.cull_kernel.x = ((self.data_entries_written + 255) / 256) as u32;
+        let mut encoder = device.create_command_encoder(&default());
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cull pass"),
+                timestamp_writes: None,
+            });
+            self.cull_kernel.dispatch(&mut pass);
+        }
+        queue.submit([encoder.finish()]);
+    }
+    fn draw<'this, 'pass>(&'this mut self, pass: &mut wgpu::RenderPass<'pass>, culled: bool)
     where
         'this: 'pass,
     {
@@ -426,7 +416,12 @@ impl Storage {
         //     pass.draw(encoded..(encoded + 3), offset..(offset + count));
         // }
         pass.multi_draw_indirect(
-            &self.indirect_draw_buffer.buffer,
+            &if culled {
+                &self.culled_indirect_draw_buffer
+            } else {
+                &self.indirect_draw_buffer
+            }
+            .buffer,
             0,
             self.data_entries_written as u32,
         );
@@ -1228,17 +1223,6 @@ impl RenderQueryState {
     }
 }
 
-fn cmap<U: Copy, V: Copy, const N: usize>(a: [U; N], f: fn(U) -> V, v_default: V) -> [V; N] {
-    let mut output: [V; N] = [v_default; N];
-    let mut i = 0;
-    while i < N {
-        let input = a[i];
-        output[i] = f(input);
-
-        i += 1;
-    }
-    output
-}
 // gen u8 from sdf, calc number of verts per cell.
 // prefix sum verts per cell
 // draw the sum of verts of vertices
@@ -1246,31 +1230,6 @@ fn cmap<U: Copy, V: Copy, const N: usize>(a: [U; N], f: fn(U) -> V, v_default: V
 //
 // passes:
 // gen verts/cell + start prefix sum
-
-fn indexify(v: &[[f32; 3]]) -> (Vec<[f32; 3]>, Vec<u32>) {
-    let mut idxs = Vec::new();
-    let mut data = Vec::new();
-
-    // slow but fine for cpu testing.
-    let mut map: HashMap<[u32; 3], usize> = HashMap::new();
-
-    for &v in v {
-        let id = {
-            let vb = v.map(|v| v.to_bits());
-            if let Some(id) = map.get(&vb) {
-                *id
-            } else {
-                let l = map.len();
-                map.insert(vb, l);
-                data.push(v);
-                l
-            }
-        };
-        idxs.push(id as _);
-    }
-
-    (data, idxs)
-}
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -1283,6 +1242,7 @@ struct CameraUniform {
     _unused0: f32,
     _unused1: f32,
     _unused2: f32,
+    cull: [[f32; 4]; 4],
 }
 struct Camera {
     pos: cgmath::Point3<f32>,
@@ -1290,6 +1250,8 @@ struct Camera {
 
     vel: cgmath::Vector3<f32>,
     rvel: cgmath::Quaternion<f32>,
+
+    debug_above: bool,
 
     time: f32,
 
@@ -1309,34 +1271,54 @@ impl Camera {
     );
     fn uniform(&self) -> CameraUniform {
         // move world to camera pos/rot
-        let view = self.view();
+        let view = self.view_cull();
 
         //Matrix4::look_at_rh((&self).pos, (&self).pos + Vector3 {x: 0.0, y: 0.0, z: 1.0 }, (&self).up);
         // projection matrix
         self.uniform_from_view(view)
     }
-    fn view(&self) -> Matrix4<f32> {
+    fn view_cull(&self) -> Matrix4<f32> {
         let b = Matrix4::from(Matrix3::from(Basis3::from_quaternion(&self.dir)));
         let view = b * Matrix4::from_translation(-self.pos.to_vec());
         view
     }
+    fn view(&self) -> Matrix4<f32> {
+        if self.debug_above {
+            let b = Matrix4::from(Matrix3::from_angle_x(Deg(90.0)));
+            let view = b * Matrix4::from_translation(-self.pos.to_vec());
+            view
+        } else {
+            self.view_cull()
+        }
+    }
     fn uniform_from_view(&self, view: Matrix4<f32>) -> CameraUniform {
-        let view_projection_matrix = Self::OPENGL_TO_WGPU_MATRIX * self.proj_view();
+        let view_projection = self.proj_view_wgpu();
 
-        let lmap = cgmath::Matrix4::from_angle_x(cgmath::Deg(34.4523423))
-            * cgmath::Matrix4::from_angle_y(cgmath::Deg(47.3478))
-            * cgmath::Matrix4::from_angle_z(cgmath::Deg(23.3894));
+        let lmap = Matrix4::from_angle_x(Deg(34.4523423))
+            * Matrix4::from_angle_y(Deg(47.3478))
+            * Matrix4::from_angle_z(Deg(23.3894));
         let lmap_inv = lmap.invert().unwrap();
+
+        let cull = Self::OPENGL_TO_WGPU_MATRIX
+            * self.proj()
+            * Matrix4::from_translation(Vector3 {
+                x: 0.0,
+                y: 0.0,
+                z: -4.0,
+            })
+            * Matrix4::from(Matrix3::from(Basis3::from_quaternion(&self.dir)))
+            * Matrix4::from_translation(-self.pos.to_vec());
 
         CameraUniform {
             view: view.into(),
-            view_proj: view_projection_matrix.into(),
+            view_proj: view_projection.into(),
             lmap: lmap.into(),
             lmap_inv: lmap_inv.into(),
             time1: self.time,
             _unused0: 0.0,
             _unused1: 0.0,
             _unused2: 0.0,
+            cull: cull.into(),
         }
     }
     fn proj(&self) -> Matrix4<f32> {
@@ -1348,8 +1330,14 @@ impl Camera {
         );
         proj
     }
+    fn proj_view_cull(&self) -> Matrix4<f32> {
+        self.proj() * self.view_cull()
+    }
     fn proj_view(&self) -> Matrix4<f32> {
         self.proj() * self.view()
+    }
+    fn proj_view_wgpu(&self) -> Matrix4<f32> {
+        Self::OPENGL_TO_WGPU_MATRIX * self.proj() * self.view_cull()
     }
     fn new(surface_config: &wgpu::SurfaceConfiguration) -> Self {
         Self {
@@ -1373,29 +1361,32 @@ impl Camera {
             vel: (0.0, 0.0, 0.0).into(),
             rvel: Quaternion::one(),
             time: 0.0,
+            debug_above: false,
         }
     }
     fn update(
         &mut self,
         surface_config: &wgpu::SurfaceConfiguration,
         dt: f32,
+        held_keys: &BTreeSet<KeyCode>,
         pressed_keys: &BTreeSet<KeyCode>,
     ) {
         self.time += dt;
-        //self.time %= 1.0;
         self.aspect = surface_config.width as f32 / surface_config.height as f32;
-        use KeyCode::{KeyA, KeyD, KeyI, KeyJ, KeyK, KeyL, KeyS, KeyW, ShiftLeft, Space};
+        use KeyCode::{KeyA, KeyD, KeyI, KeyJ, KeyK, KeyL, KeyS, KeyU, KeyW, ShiftLeft, Space};
 
-        let key = |key: KeyCode| pressed_keys.contains(&key) as u8 as f32;
+        let held = |key: KeyCode| held_keys.contains(&key) as u8 as f32;
+
+        self.debug_above ^= pressed_keys.contains(&KeyU);
 
         let delta = Vector3 {
-            x: key(KeyD) - key(KeyA),
-            y: key(Space) - key(ShiftLeft),
-            z: key(KeyS) - key(KeyW),
+            x: held(KeyD) - held(KeyA),
+            y: held(Space) - held(ShiftLeft),
+            z: held(KeyS) - held(KeyW),
         };
 
-        let ry = key(KeyL) - key(KeyJ);
-        let rx = key(KeyK) - key(KeyI);
+        let ry = held(KeyL) - held(KeyJ);
+        let rx = held(KeyK) - held(KeyI);
 
         let tmp_basis = Basis3::from(self.dir);
         let tmp_basis_i = Matrix3::from(tmp_basis.invert());
@@ -1413,21 +1404,21 @@ impl Camera {
         self.rvel = self.rvel * &r1;
         self.rvel = self.rvel.slerp(Quaternion::one(), 0.1);
 
-        self.dir = self.dir.slerp(
-            Quaternion::look_at(
-                Vector3 {
-                    x: tmp_basis_i.z.x,
-                    y: tmp_basis_i.z.y * 0.7,
-                    z: tmp_basis_i.z.z,
-                },
-                Vector3 {
-                    x: 0.0,
-                    y: 1.0,
-                    z: 0.0,
-                },
-            ),
-            0.01,
-        );
+        // self.dir = self.dir.slerp(
+        //     Quaternion::look_at(
+        //         Vector3 {
+        //             x: tmp_basis_i.z.x,
+        //             y: tmp_basis_i.z.y * 0.7,
+        //             z: tmp_basis_i.z.z,
+        //         },
+        //         Vector3 {
+        //             x: 0.0,
+        //             y: 1.0,
+        //             z: 0.0,
+        //         },
+        //     ),
+        //     0.01,
+        // );
 
         self.dir = self.dir * self.rvel;
     }
@@ -1672,133 +1663,8 @@ impl UpdateRenderPipeline {
     }
 }
 
-#[derive(Debug)]
-struct HumanSize<T>(T);
-impl<T: Into<u64> + Copy> Display for HumanSize<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let n: u64 = self.0.into();
-
-        if n < 1024 {
-            write!(f, "{} B", n)
-        } else if n < 1024 * 1024 {
-            write!(f, "{} KiB", n / 1024)
-        } else if n < 1024 * 1024 * 1024 {
-            write!(f, "{} MiB", n / 1024 / 1024)
-        } else {
-            write!(f, "{} GiB", n / 1024 / 1024 / 1024)
-        }
-    }
-}
-
-#[derive(Debug)]
-struct LimitsCmp {
-    max_texture_dimension_1d: [u32; 2],
-    max_texture_dimension_2d: [u32; 2],
-    max_texture_dimension_3d: [u32; 2],
-    max_texture_array_layers: [u32; 2],
-    max_bind_groups: [u32; 2],
-    max_bindings_per_bind_group: [u32; 2],
-    max_dynamic_uniform_buffers_per_pipeline_layout: [u32; 2],
-    max_dynamic_storage_buffers_per_pipeline_layout: [u32; 2],
-    max_sampled_textures_per_shader_stage: [u32; 2],
-    max_samplers_per_shader_stage: [u32; 2],
-    max_storage_buffers_per_shader_stage: [u32; 2],
-    max_storage_textures_per_shader_stage: [u32; 2],
-    max_uniform_buffers_per_shader_stage: [u32; 2],
-    max_uniform_buffer_binding_size: [HumanSize<u32>; 2],
-    max_storage_buffer_binding_size: [HumanSize<u32>; 2],
-    max_vertex_buffers: [u32; 2],
-    max_buffer_size: [HumanSize<u64>; 2],
-    max_vertex_attributes: [u32; 2],
-    max_vertex_buffer_array_stride: [u32; 2],
-    min_uniform_buffer_offset_alignment: [u32; 2],
-    min_storage_buffer_offset_alignment: [u32; 2],
-    max_inter_stage_shader_components: [u32; 2],
-    max_compute_workgroup_storage_size: [HumanSize<u32>; 2],
-    max_compute_invocations_per_workgroup: [u32; 2],
-    max_compute_workgroup_size_x: [u32; 2],
-    max_compute_workgroup_size_y: [u32; 2],
-    max_compute_workgroup_size_z: [u32; 2],
-    max_compute_workgroups_per_dimension: [u32; 2],
-    max_push_constant_size: [u32; 2],
-    max_non_sampler_bindings: [u32; 2],
-}
-impl Display for LimitsCmp {
-    #[rustfmt::skip]
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "LimitsCmp {{")?;
-        writeln!(f, "max_texture_dimension_1d: {}, {}", self.max_texture_dimension_1d[0], self.max_texture_dimension_1d[1])?;
-        writeln!(f, "max_texture_dimension_2d: {}, {}", self.max_texture_dimension_2d[0], self.max_texture_dimension_2d[1])?;
-        writeln!(f, "max_texture_dimension_3d: {}, {}", self.max_texture_dimension_3d[0], self.max_texture_dimension_3d[1])?;
-        writeln!(f, "max_texture_array_layers: {}, {}", self.max_texture_array_layers[0], self.max_texture_array_layers[1])?;
-        writeln!(f, "max_bind_groups: {}, {}", self.max_bind_groups[0], self.max_bind_groups[1])?;
-        writeln!(f, "max_bindings_per_bind_group: {}, {}", self.max_bindings_per_bind_group[0], self.max_bindings_per_bind_group[1])?;
-        writeln!(f, "max_dynamic_uniform_buffers_per_pipeline_layout: {}, {}", self.max_dynamic_uniform_buffers_per_pipeline_layout[0], self.max_dynamic_uniform_buffers_per_pipeline_layout[1])?;
-        writeln!(f, "max_dynamic_storage_buffers_per_pipeline_layout: {}, {}", self.max_dynamic_storage_buffers_per_pipeline_layout[0], self.max_dynamic_storage_buffers_per_pipeline_layout[1])?;
-        writeln!(f, "max_sampled_textures_per_shader_stage: {}, {}", self.max_sampled_textures_per_shader_stage[0], self.max_sampled_textures_per_shader_stage[1])?;
-        writeln!(f, "max_samplers_per_shader_stage: {}, {}", self.max_samplers_per_shader_stage[0], self.max_samplers_per_shader_stage[1])?;
-        writeln!(f, "max_storage_buffers_per_shader_stage: {}, {}", self.max_storage_buffers_per_shader_stage[0], self.max_storage_buffers_per_shader_stage[1])?;
-        writeln!(f, "max_storage_textures_per_shader_stage: {}, {}", self.max_storage_textures_per_shader_stage[0], self.max_storage_textures_per_shader_stage[1])?;
-        writeln!(f, "max_uniform_buffers_per_shader_stage: {}, {}", self.max_uniform_buffers_per_shader_stage[0], self.max_uniform_buffers_per_shader_stage[1])?;
-        writeln!(f, "max_uniform_buffer_binding_size: {}, {}", self.max_uniform_buffer_binding_size[0], self.max_uniform_buffer_binding_size[1])?;
-        writeln!(f, "max_storage_buffer_binding_size: {}, {}", self.max_storage_buffer_binding_size[0], self.max_storage_buffer_binding_size[1])?;
-        writeln!(f, "max_vertex_buffers: {}, {}", self.max_vertex_buffers[0], self.max_vertex_buffers[1])?;
-        writeln!(f, "max_buffer_size: {}, {}", self.max_buffer_size[0], self.max_buffer_size[1])?;
-        writeln!(f, "max_vertex_attributes: {}, {}", self.max_vertex_attributes[0], self.max_vertex_attributes[1])?;
-        writeln!(f, "max_vertex_buffer_array_stride: {}, {}", self.max_vertex_buffer_array_stride[0], self.max_vertex_buffer_array_stride[1])?;
-        writeln!(f, "min_uniform_buffer_offset_alignment: {}, {}", self.min_uniform_buffer_offset_alignment[0], self.min_uniform_buffer_offset_alignment[1])?;
-        writeln!(f, "min_storage_buffer_offset_alignment: {}, {}", self.min_storage_buffer_offset_alignment[0], self.min_storage_buffer_offset_alignment[1])?;
-        writeln!(f, "max_inter_stage_shader_components: {}, {}", self.max_inter_stage_shader_components[0], self.max_inter_stage_shader_components[1])?;
-        writeln!(f, "max_compute_workgroup_storage_size: {}, {}", self.max_compute_workgroup_storage_size[0], self.max_compute_workgroup_storage_size[1])?;
-        writeln!(f, "max_compute_invocations_per_workgroup: {}, {}", self.max_compute_invocations_per_workgroup[0], self.max_compute_invocations_per_workgroup[1])?;
-        writeln!(f, "max_compute_workgroup_size_x: {}, {}", self.max_compute_workgroup_size_x[0], self.max_compute_workgroup_size_x[1])?;
-        writeln!(f, "max_compute_workgroup_size_y: {}, {}", self.max_compute_workgroup_size_y[0], self.max_compute_workgroup_size_y[1])?;
-        writeln!(f, "max_compute_workgroup_size_z: {}, {}", self.max_compute_workgroup_size_z[0], self.max_compute_workgroup_size_z[1])?;
-        writeln!(f, "max_compute_workgroups_per_dimension: {}, {}", self.max_compute_workgroups_per_dimension[0], self.max_compute_workgroups_per_dimension[1])?;
-        writeln!(f, "max_push_constant_size: {}, {}", self.max_push_constant_size[0], self.max_push_constant_size[1])?;
-        writeln!(f, "max_non_sampler_bindings: {}, {}", self.max_non_sampler_bindings[0], self.max_non_sampler_bindings[1])?;
-        writeln!(f, "}}")?;
-
-        Ok(())
-    }
-}
-impl LimitsCmp {
-    #[rustfmt::skip]
-    fn new(a: &wgpu::Limits, b: &wgpu::Limits) -> Self {
-        Self {
-            max_texture_dimension_1d: [a.max_texture_dimension_1d, b.max_texture_dimension_1d],
-            max_texture_dimension_2d: [a.max_texture_dimension_2d, b.max_texture_dimension_2d],
-            max_texture_dimension_3d: [a.max_texture_dimension_3d, b.max_texture_dimension_3d],
-            max_texture_array_layers: [a.max_texture_array_layers, b.max_texture_array_layers],
-            max_bind_groups: [a.max_bind_groups, b.max_bind_groups],
-            max_bindings_per_bind_group: [a.max_bindings_per_bind_group, b.max_bindings_per_bind_group],
-            max_dynamic_uniform_buffers_per_pipeline_layout: [a.max_dynamic_uniform_buffers_per_pipeline_layout, b.max_dynamic_uniform_buffers_per_pipeline_layout],
-            max_dynamic_storage_buffers_per_pipeline_layout: [a.max_dynamic_storage_buffers_per_pipeline_layout, b.max_dynamic_storage_buffers_per_pipeline_layout],
-            max_sampled_textures_per_shader_stage: [a.max_sampled_textures_per_shader_stage, b.max_sampled_textures_per_shader_stage],
-            max_samplers_per_shader_stage: [a.max_samplers_per_shader_stage, b.max_samplers_per_shader_stage],
-            max_storage_buffers_per_shader_stage: [a.max_storage_buffers_per_shader_stage, b.max_storage_buffers_per_shader_stage],
-            max_storage_textures_per_shader_stage: [a.max_storage_textures_per_shader_stage, b.max_storage_textures_per_shader_stage],
-            max_uniform_buffers_per_shader_stage: [a.max_uniform_buffers_per_shader_stage, b.max_uniform_buffers_per_shader_stage],
-            max_uniform_buffer_binding_size: [a.max_uniform_buffer_binding_size, b.max_uniform_buffer_binding_size].map(HumanSize),
-            max_storage_buffer_binding_size: [a.max_storage_buffer_binding_size, b.max_storage_buffer_binding_size].map(HumanSize),
-            max_vertex_buffers: [a.max_vertex_buffers, b.max_vertex_buffers],
-            max_buffer_size: [a.max_buffer_size, b.max_buffer_size].map(HumanSize),
-            max_vertex_attributes: [a.max_vertex_attributes, b.max_vertex_attributes],
-            max_vertex_buffer_array_stride: [a.max_vertex_buffer_array_stride, b.max_vertex_buffer_array_stride],
-            min_uniform_buffer_offset_alignment: [a.min_uniform_buffer_offset_alignment, b.min_uniform_buffer_offset_alignment],
-            min_storage_buffer_offset_alignment: [a.min_storage_buffer_offset_alignment, b.min_storage_buffer_offset_alignment],
-            max_inter_stage_shader_components: [a.max_inter_stage_shader_components, b.max_inter_stage_shader_components],
-            max_compute_workgroup_storage_size: [a.max_compute_workgroup_storage_size, b.max_compute_workgroup_storage_size].map(HumanSize),
-            max_compute_invocations_per_workgroup: [a.max_compute_invocations_per_workgroup, b.max_compute_invocations_per_workgroup],
-            max_compute_workgroup_size_x: [a.max_compute_workgroup_size_x, b.max_compute_workgroup_size_x],
-            max_compute_workgroup_size_y: [a.max_compute_workgroup_size_y, b.max_compute_workgroup_size_y],
-            max_compute_workgroup_size_z: [a.max_compute_workgroup_size_z, b.max_compute_workgroup_size_z],
-            max_compute_workgroups_per_dimension: [a.max_compute_workgroups_per_dimension, b.max_compute_workgroups_per_dimension],
-            max_push_constant_size: [a.max_push_constant_size, b.max_push_constant_size],
-            max_non_sampler_bindings: [a.max_non_sampler_bindings, b.max_non_sampler_bindings],
-        }
-    }
-}
+use limits::LimitsCmp;
+mod limits;
 
 struct State<'a> {
     device: wgpu::Device,
@@ -1814,7 +1680,7 @@ struct State<'a> {
     bitpack_bind_group: wgpu::BindGroup,
     // triangle_storage: wgpu::Buffer,
     t0: Instant,
-    camera_buffer: wgpu::Buffer,
+    camera_buffer: MetaBuffer,
     last_time: Instant,
     last_count: u32,
     storage: Storage,
@@ -1895,15 +1761,11 @@ impl<'a> State<'a> {
 
         let camera = Camera::new(&surface_config);
 
-        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck::cast_slice(&[camera.uniform()]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
+        let camera_buffer = MetaBuffer::new_uniform(&device, UNIFORM | COPY_DST, &camera.uniform());
 
         let depth_texture = Texture::new_depth(&device, &surface_config);
 
-        let storage = Storage::new(&device, &cube_march);
+        let storage = Storage::new(&device, &cube_march, &camera_buffer);
 
         let bitpack_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("bitpack_layout"),
@@ -1930,10 +1792,7 @@ impl<'a> State<'a> {
             label: Some("bitpack_bind_group"),
             layout: &bitpack_layout,
             entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: camera_buffer.as_entire_binding(),
-                },
+                camera_buffer.binding(0),
                 storage.trigen.render_case_uniform.binding(1),
             ],
         });
@@ -1995,7 +1854,7 @@ impl<'a> State<'a> {
             wireframe_render_pipeline,
         }
     }
-    fn render(&mut self, pressed_keys: &BTreeSet<KeyCode>) {
+    fn render(&mut self, held_keys: &BTreeSet<KeyCode>, pressed_keys: &BTreeSet<KeyCode>) {
         let dt = replace(&mut self.t0, Instant::now())
             .elapsed()
             .as_secs_f32();
@@ -2005,43 +1864,9 @@ impl<'a> State<'a> {
         self.storage
             .dispatch(&self.device, &self.queue, self.camera.pos);
         let mut first = true;
-        if true {
-            let pipeline = self.wireframe_render_pipeline.get(&self.device);
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: None,
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: if first {
-                            wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 0.1,
-                                g: 0.2,
-                                b: 0.3,
-                                a: 1.0,
-                            })
-                        } else {
-                            wgpu::LoadOp::Load
-                        },
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_texture.view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            render_pass.set_pipeline(pipeline);
-            render_pass.set_bind_group(0, &self.bitpack_bind_group, &[]);
-            self.storage.draw(&mut render_pass);
-            first = false;
-        }
+
+        self.storage.cull(&self.device, &self.queue);
+
         if true {
             let pipeline = self.bitpack_render_pipeline.get(&self.device);
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2066,7 +1891,11 @@ impl<'a> State<'a> {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth_texture.view,
                     depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
+                        load: if first {
+                            wgpu::LoadOp::Clear(1.0)
+                        } else {
+                            wgpu::LoadOp::Load
+                        },
                         store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
@@ -2076,10 +1905,54 @@ impl<'a> State<'a> {
             });
             render_pass.set_pipeline(pipeline);
             render_pass.set_bind_group(0, &self.bitpack_bind_group, &[]);
-            self.storage.draw(&mut render_pass);
+            self.storage.draw(&mut render_pass, true);
             first = false;
         }
-        self.camera.update(&self.surface_config, dt, pressed_keys);
+
+        if false {
+            let pipeline = self.wireframe_render_pipeline.get(&self.device);
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: if first {
+                            wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.1,
+                                g: 0.2,
+                                b: 0.3,
+                                a: 1.0,
+                            })
+                        } else {
+                            wgpu::LoadOp::Load
+                        },
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_texture.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: if first {
+                            wgpu::LoadOp::Clear(1.0)
+                        } else {
+                            wgpu::LoadOp::Load
+                        },
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            render_pass.set_pipeline(pipeline);
+            render_pass.set_bind_group(0, &self.bitpack_bind_group, &[]);
+            self.storage.draw(&mut render_pass, false);
+            first = false;
+        }
+
+        self.camera
+            .update(&self.surface_config, dt, held_keys, pressed_keys);
         //let t = self.t0.elapsed().as_secs_f32();
         // self.camera.eye = (
         //     2.0 * t.sin(),
@@ -2088,11 +1961,7 @@ impl<'a> State<'a> {
         // )
         //     .into();
         // self.camera.eye *= 32.0;
-        self.queue.write_buffer(
-            &self.camera_buffer,
-            0,
-            bytemuck::cast_slice(&[self.camera.uniform()]),
-        );
+        self.camera_buffer.write(&self.queue, self.camera.uniform());
         self.queue.submit([encoder.finish()]);
         output.present();
         let elapsed = self.last_time.elapsed().as_secs_f64();
@@ -2141,6 +2010,7 @@ fn main() {
     let mut state = State::new(window, &cube_march);
     println!("start event loop");
 
+    let mut held_keys = BTreeSet::new();
     let mut pressed_keys = BTreeSet::new();
 
     event_loop
@@ -2153,7 +2023,8 @@ fn main() {
                             event: KeyEvent { logical_key: winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape), .. }, ..
                         } => window_target.exit(),
                         WindowEvent::RedrawRequested => {
-                            state.render(&pressed_keys);
+                            state.render(&held_keys, &pressed_keys);
+                            pressed_keys.clear();
                             window.request_redraw();
                         }
                         WindowEvent::Resized(size) => {
@@ -2161,8 +2032,10 @@ fn main() {
                         }
                         WindowEvent::KeyboardInput { event: winit::event::KeyEvent { physical_key: winit::keyboard::PhysicalKey::Code(key_code), state, ..}, ..} => {
                             if state.is_pressed() {
+                                let _: bool = held_keys.insert(key_code);
                                 let _: bool = pressed_keys.insert(key_code);
                             } else {
+                                let _: bool = held_keys.remove(&key_code);
                                 let _: bool = pressed_keys.remove(&key_code);
                             }
                         }
