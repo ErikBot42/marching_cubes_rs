@@ -262,7 +262,7 @@ impl Storage {
         let pos = (pos).map(|f| ((f / 2.0) as i32).max(0).min(1023) as u32);
         let target: (u32, u32, u32) = (pos.x, pos.y, pos.z);
         //dbg!(pos);
-        let radius = 3;
+        let radius = 5;
 
         self.query = self.query.take().map(|mut q| {
             q.resolve(device, queue);
@@ -285,7 +285,7 @@ impl Storage {
             }
         }
 
-        for _ in 0..1 {
+        for _ in 0..4 {
             if self.capacity < self.offset + MAX_TRIS_PER_CHUNK {
                 break;
             }
@@ -387,17 +387,13 @@ impl Storage {
             self.data_entries_written = self.data.len();
         }
     }
-    fn cull(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+    fn cull(&mut self, encoder: &mut wgpu::CommandEncoder) {
         self.cull_kernel.x = ((self.data_entries_written + 255) / 256) as u32;
-        let mut encoder = device.create_command_encoder(&default());
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("cull pass"),
-                timestamp_writes: None,
-            });
-            self.cull_kernel.dispatch(&mut pass);
-        }
-        queue.submit([encoder.finish()]);
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("cull pass"),
+            timestamp_writes: None,
+        });
+        self.cull_kernel.dispatch(&mut pass);
     }
     fn draw<'this, 'pass>(&'this mut self, pass: &mut wgpu::RenderPass<'pass>, culled: bool)
     where
@@ -654,6 +650,7 @@ struct ChunkUniform {
 }
 
 struct Kernel {
+    timestamp: TimestampQuerySet,
     pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
     x: u32,
@@ -665,6 +662,7 @@ impl Kernel {
         buffers: &[(wgpu::BufferBindingType, &MetaBuffer)],
         x: u32,
     ) -> Self {
+        let timestamp = TimestampQuerySet::new(device);
         let (binding_entry_layouts, binding_entries): (Vec<_>, Vec<_>) = buffers
             .iter()
             .zip(0..)
@@ -707,12 +705,20 @@ impl Kernel {
             pipeline,
             bind_group,
             x,
+            timestamp,
         }
     }
-    fn dispatch<'s: 'c, 'c>(&'s self, pass: &mut wgpu::ComputePass<'c>) {
+    fn dispatch<'s: 'c, 'c>(&'s mut self, pass: &mut wgpu::ComputePass<'c>) {
+        let timestamp = self.timestamp.push();
+        if let Some((start, _)) = timestamp {
+            pass.write_timestamp(&self.timestamp.query_set, start);
+        }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.dispatch_workgroups(self.x, 1, 1);
+        if let Some((_, end)) = timestamp {
+            pass.write_timestamp(&self.timestamp.query_set, end);
+        }
     }
 }
 
@@ -831,7 +837,7 @@ impl TriGenState {
 
     }
     fn dispatch(
-        &self,
+        &mut self,
         encoder: &mut wgpu::CommandEncoder,
         staging_buffer: &MetaBuffer,
         query: Option<QuerySetState<MarkerPrePass>>,
@@ -1239,8 +1245,8 @@ struct CameraUniform {
     lmap: [[f32; 4]; 4],
     lmap_inv: [[f32; 4]; 4],
     time1: f32,
-    _unused0: f32,
-    _unused1: f32,
+    cull_radius: f32,
+    fog_inv: f32,
     _unused2: f32,
     cull: [[f32; 4]; 4],
 }
@@ -1269,13 +1275,13 @@ impl Camera {
         0.0, 0.0, 0.5, 0.5,
         0.0, 0.0, 0.0, 1.0,
     );
-    fn uniform(&self) -> CameraUniform {
+    fn uniform(&self, gui: &GuiState) -> CameraUniform {
         // move world to camera pos/rot
         let view = self.view_cull();
 
         //Matrix4::look_at_rh((&self).pos, (&self).pos + Vector3 {x: 0.0, y: 0.0, z: 1.0 }, (&self).up);
         // projection matrix
-        self.uniform_from_view(view)
+        self.uniform_from_view(view, gui)
     }
     fn view_cull(&self) -> Matrix4<f32> {
         let b = Matrix4::from(Matrix3::from(Basis3::from_quaternion(&self.dir)));
@@ -1291,7 +1297,7 @@ impl Camera {
             self.view_cull()
         }
     }
-    fn uniform_from_view(&self, view: Matrix4<f32>) -> CameraUniform {
+    fn uniform_from_view(&self, view: Matrix4<f32>, gui: &GuiState) -> CameraUniform {
         let view_projection = self.proj_view_wgpu();
 
         let lmap = Matrix4::from_angle_x(Deg(34.4523423))
@@ -1315,8 +1321,8 @@ impl Camera {
             lmap: lmap.into(),
             lmap_inv: lmap_inv.into(),
             time1: self.time,
-            _unused0: 0.0,
-            _unused1: 0.0,
+            cull_radius: gui.cull_radius(),
+            fog_inv: 1.0 / gui.fog().powi(2),
             _unused2: 0.0,
             cull: cull.into(),
         }
@@ -1341,11 +1347,11 @@ impl Camera {
     }
     fn new(surface_config: &wgpu::SurfaceConfiguration) -> Self {
         Self {
-            pos: (0.0, 0.0, 0.0).into(),
+            pos: Point3::from((1.0, 1.0, 1.0)) * 32.0,
             aspect: surface_config.width as f32 / surface_config.height as f32,
             fovy: 45.0,
             znear: 0.01,
-            zfar: 10.0,
+            zfar: 100.0,
             dir: Quaternion::look_at(
                 Vector3 {
                     x: -1.0,
@@ -1371,13 +1377,12 @@ impl Camera {
         held_keys: &BTreeSet<KeyCode>,
         pressed_keys: &BTreeSet<KeyCode>,
     ) {
+        let dt = dt.max(0.004).min(0.1);
         self.time += dt;
         self.aspect = surface_config.width as f32 / surface_config.height as f32;
-        use KeyCode::{KeyA, KeyD, KeyI, KeyJ, KeyK, KeyL, KeyS, KeyU, KeyW, ShiftLeft, Space};
+        use KeyCode::{KeyA, KeyD, KeyI, KeyJ, KeyK, KeyL, KeyS, KeyU, KeyW, ShiftLeft, Space, KeyO};
 
         let held = |key: KeyCode| held_keys.contains(&key) as u8 as f32;
-
-        self.debug_above ^= pressed_keys.contains(&KeyU);
 
         let delta = Vector3 {
             x: held(KeyD) - held(KeyA),
@@ -1387,38 +1392,30 @@ impl Camera {
 
         let ry = held(KeyL) - held(KeyJ);
         let rx = held(KeyK) - held(KeyI);
+        let rz = held(KeyO) - held(KeyU);
 
         let tmp_basis = Basis3::from(self.dir);
         let tmp_basis_i = Matrix3::from(tmp_basis.invert());
         let tmp_basis = Matrix3::from(tmp_basis);
 
         // self.pos += (tmp_basis.invert().unwrap() * delta) * dt * 10.0;
-        self.vel += (tmp_basis.invert().unwrap() * delta) * dt * 10.0;
-        self.vel -= self.vel * cgmath::dot(self.vel, self.vel) * 0.2;
+        self.vel += (tmp_basis.invert().unwrap() * delta) * dt * 5.0;
+        if self.vel.magnitude() > 0.0001 {
+            self.vel -= self.vel * 0.05;
+            self.vel -= self.vel.normalize() * dot(self.vel, self.vel) * 0.005;
+        } else {
+            self.vel = (0.0, 0.0, 0.0).into();
+        }
         self.pos += self.vel * dt;
 
         let r1 = Quaternion::from_axis_angle(tmp_basis_i.x, Rad(rx * dt * 0.2));
         let r2 = Quaternion::from_axis_angle(tmp_basis_i.y, Rad(ry * dt * 0.2));
+        let r3 = Quaternion::from_axis_angle(tmp_basis_i.z, Rad(rz * dt * 0.2));
 
+        self.rvel = self.rvel * &r3;
         self.rvel = self.rvel * &r2;
         self.rvel = self.rvel * &r1;
         self.rvel = self.rvel.slerp(Quaternion::one(), 0.1);
-
-        // self.dir = self.dir.slerp(
-        //     Quaternion::look_at(
-        //         Vector3 {
-        //             x: tmp_basis_i.z.x,
-        //             y: tmp_basis_i.z.y * 0.7,
-        //             z: tmp_basis_i.z.z,
-        //         },
-        //         Vector3 {
-        //             x: 0.0,
-        //             y: 1.0,
-        //             z: 0.0,
-        //         },
-        //     ),
-        //     0.01,
-        // );
 
         self.dir = self.dir * self.rvel;
     }
@@ -1509,6 +1506,141 @@ impl Texture {
         }
     }
 }
+
+struct TimestampQuerySet {
+    s0: u64,
+    s1: f64,
+    s2: f64,
+    query_set: wgpu::QuerySet,
+    resolve_buffer: wgpu::Buffer,
+    staging_buffer: wgpu::Buffer,
+    i: u32,
+    mean: f64,
+    sd: f64,
+}
+impl TimestampQuerySet {
+    fn new(device: &wgpu::Device) -> Self {
+        let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("Timestamp query set"),
+            ty: wgpu::QueryType::Timestamp,
+            count: wgpu::QUERY_SET_MAX_QUERIES,
+        });
+        let resolve_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Timestap resolve buffer"),
+            size: wgpu::QUERY_SET_MAX_QUERIES as u64 * size_of::<u64>() as u64,
+            usage: QUERY_RESOLVE | COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Timestap staging buffer"),
+            size: wgpu::QUERY_SET_MAX_QUERIES as u64 * size_of::<u64>() as u64,
+            usage: MAP_READ | COPY_DST,
+            mapped_at_creation: false,
+        });
+        let i = 0;
+        Self {
+            query_set,
+            resolve_buffer,
+            staging_buffer,
+            i,
+            s0: 0,
+            s1: 0.0,
+            s2: 0.0,
+            mean: 0.0,
+            sd: 0.0,
+        }
+    }
+    fn push(&mut self) -> Option<(u32, u32)> {
+        (self.i < wgpu::QUERY_SET_MAX_QUERIES).then(|| {
+            let res = (self.i, self.i + 1);
+            self.i += 2;
+            res
+        })
+    }
+    fn compute_timestamp_writes<'a>(&'a mut self) -> Option<wgpu::ComputePassTimestampWrites<'a>> {
+        self.push()
+            .map(|(start, end)| wgpu::ComputePassTimestampWrites {
+                query_set: &self.query_set,
+                beginning_of_pass_write_index: Some(start),
+                end_of_pass_write_index: Some(end),
+            })
+    }
+    fn render_timestamp_writes<'a>(&'a mut self) -> Option<wgpu::RenderPassTimestampWrites<'a>> {
+        self.push()
+            .map(|(start, end)| wgpu::RenderPassTimestampWrites {
+                query_set: &self.query_set,
+                beginning_of_pass_write_index: Some(start),
+                end_of_pass_write_index: Some(end),
+            })
+    }
+    fn resolve_copy(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if self.i == 0 {
+            return;
+        }
+        encoder.resolve_query_set(&self.query_set, 0..self.i, &self.resolve_buffer, 0);
+        let bytes_to_copy = self.i as u64 * size_of::<u64>() as u64;
+        encoder.copy_buffer_to_buffer(
+            &self.resolve_buffer,
+            0,
+            &self.staging_buffer,
+            0,
+            bytes_to_copy,
+        );
+    }
+    fn resolve_map(&mut self) {
+        if self.i == 0 {
+            return;
+        }
+        let bytes_copied = self.i as u64 * size_of::<u64>() as u64;
+        self.staging_buffer
+            .slice(0..bytes_copied)
+            .map_async(wgpu::MapMode::Read, |_| ());
+    }
+    fn resolve_unmap(&mut self, seconds_per_tick: f64) {
+        if self.i == 0 {
+            return;
+        }
+        #[repr(C)]
+        #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct Query {
+            start: u64,
+            end: u64,
+        }
+        let bytes_copied = self.i as u64 * size_of::<u64>() as u64;
+        if self.i == 0 {
+            return;
+        }
+        let tmp = self
+            .staging_buffer
+            .slice(0..bytes_copied)
+            .get_mapped_range();
+        let data: &[Query] = bytemuck::cast_slice(&tmp);
+        for &Query { start, end } in data {
+            let elapsed = (end - start) as f64 * seconds_per_tick;
+            self.s0 += 1;
+            self.s1 += elapsed;
+            self.s2 += elapsed * elapsed;
+        }
+        drop(tmp);
+        self.staging_buffer.unmap();
+        let Self { s0, s1, s2, .. } = *self;
+        let s0 = (s0 as f64).max(4.0);
+        let mean = s1 / s0;
+        let sd = ((s2 * s0 - s1 * s1) / (s0 * (s0 - 1.0))).sqrt();
+
+        self.i = 0;
+        self.mean = mean;
+        self.sd = sd;
+    }
+    fn reset(&mut self) {
+        self.s0 = 0;
+        self.s1 = 0.0;
+        self.s2 = 0.0;
+        self.mean = 0.0;
+        self.sd = 0.0;
+    }
+}
+
 struct UpdateRenderPipeline {
     path: String,
     filename: String,
@@ -1520,6 +1652,7 @@ struct UpdateRenderPipeline {
     vs_main: &'static str,
     fs_main: &'static str,
     polygon_mode: wgpu::PolygonMode,
+    timestamp: TimestampQuerySet,
 }
 impl UpdateRenderPipeline {
     fn new(
@@ -1547,6 +1680,8 @@ impl UpdateRenderPipeline {
             polygon_mode,
         );
 
+        let timestamp = TimestampQuerySet::new(device);
+
         Self {
             path: format!("src/{filename}.wgsl"),
             last_update: COMPILE_TIME,
@@ -1558,9 +1693,16 @@ impl UpdateRenderPipeline {
             vs_main,
             fs_main,
             polygon_mode,
+            timestamp,
         }
     }
-    fn get(&mut self, device: &wgpu::Device) -> &wgpu::RenderPipeline {
+    fn get<'a>(
+        &'a mut self,
+        device: &wgpu::Device,
+    ) -> (
+        Option<wgpu::RenderPassTimestampWrites<'a>>,
+        &wgpu::RenderPipeline,
+    ) {
         #[cfg(not(debug_assertions))]
         {
             return &self.pipeline;
@@ -1594,7 +1736,7 @@ impl UpdateRenderPipeline {
             }
         }
 
-        &self.pipeline
+        (self.timestamp.render_timestamp_writes(), &self.pipeline)
     }
     fn reconstruct(
         device: &wgpu::Device,
@@ -1663,8 +1805,223 @@ impl UpdateRenderPipeline {
     }
 }
 
+pub(crate) use egui_render::EguiRenderer;
+mod egui_render {
+    pub(crate) struct EguiRenderer {
+        ctx: egui::Context,
+        state: egui_winit::State,
+        renderer: egui_wgpu::Renderer,
+    }
+    impl EguiRenderer {
+        pub(crate) fn new(
+            device: &wgpu::Device,
+            color_format: wgpu::TextureFormat,
+            //depth_format: wgpu::TextureFormat,
+            window: &winit::window::Window,
+        ) -> Self {
+            let ctx = egui::Context::default();
+            let id = ctx.viewport_id();
+
+            let visuals = egui::Visuals::default();
+
+            ctx.set_visuals(visuals);
+
+            let state = egui_winit::State::new(ctx.clone(), id, &window, None, None);
+
+            let renderer = egui_wgpu::Renderer::new(device, color_format, None, 1);
+
+            Self {
+                ctx,
+                state,
+                renderer,
+            }
+        }
+        pub(crate) fn input(
+            &mut self,
+            window: &winit::window::Window,
+            event: &winit::event::WindowEvent,
+        ) -> egui_winit::EventResponse {
+            self.state.on_window_event(window, event)
+        }
+        pub(crate) fn draw(
+            &mut self,
+            device: &wgpu::Device,
+            queue: &wgpu::Queue,
+            encoder: &mut wgpu::CommandEncoder,
+            window: &winit::window::Window,
+            window_surface_view: &wgpu::TextureView,
+            screen_descriptor: egui_wgpu::ScreenDescriptor,
+            run_ui: impl FnOnce(&egui::Context),
+        ) {
+            let input = self.state.take_egui_input(&window);
+            let output = self.ctx.run(input, |ui| run_ui(ui));
+
+            self.state
+                .handle_platform_output(&window, output.platform_output);
+
+            let paint_jobs = self.ctx.tessellate(output.shapes, output.pixels_per_point);
+
+            for (id, image_delta) in &output.textures_delta.set {
+                self.renderer
+                    .update_texture(device, queue, *id, image_delta)
+            }
+
+            let _: Vec<wgpu::CommandBuffer> = self.renderer.update_buffers(
+                device,
+                queue,
+                encoder,
+                &paint_jobs,
+                &screen_descriptor,
+            );
+
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("egui render pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &window_surface_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            self.renderer
+                .render(&mut rpass, &paint_jobs, &screen_descriptor);
+            drop(rpass);
+            for texture in &output.textures_delta.free {
+                self.renderer.free_texture(texture);
+            }
+        }
+    }
+}
+
 use limits::LimitsCmp;
 mod limits;
+
+#[derive(Default)]
+struct TimeStamps {
+    render: (f64, f64),
+    wireframe: (f64, f64),
+    sdf: (f64, f64),
+    triangle_allocation: (f64, f64),
+    prefix_top: (f64, f64),
+    triangle_writeback: (f64, f64),
+    cull: (f64, f64),
+    fps: f64,
+}
+
+struct GuiState {
+    culling: bool,
+    distance_culling: bool,
+    cull_radius: f32,
+    wireframe: bool,
+    filled: bool,
+    fog_radius: f32,
+    fog: bool,
+    show_render: bool,
+
+    timestamps: TimeStamps,
+}
+impl GuiState {
+    fn new() -> Self {
+        Self {
+            culling: true,
+            cull_radius: 6.0,
+            distance_culling: true,
+            wireframe: false,
+            filled: true,
+            fog_radius: 0.9,
+            fog: true,
+            timestamps: TimeStamps::default(),
+            show_render: true,
+        }
+    }
+    fn run(&mut self, ui: &egui::Context) {
+        egui::Window::new("Options")
+            .default_open(true)
+            .min_width(200.0)
+            //.max_width(1000.0)
+            //.max_height(800.0)
+            //.default_width(800.0)
+            .resizable(true)
+            .anchor(egui::Align2::LEFT_TOP, [0.0, 0.0])
+            .show(&ui, |ui| {
+                ui.checkbox(&mut self.filled, "Regular geometry");
+                ui.checkbox(&mut self.wireframe, "Wireframe");
+
+                ui.separator();
+
+                ui.checkbox(&mut self.culling, "Frustrum culling");
+                if self.culling {
+                    ui.checkbox(&mut self.distance_culling, "Distance culling");
+                    if self.distance_culling {
+                        ui.add(egui::Slider::new(&mut self.cull_radius, 1.0..=16.0).text("radius"));
+                    }
+                }
+
+                ui.separator();
+
+                if self.culling && self.distance_culling {
+                    ui.checkbox(&mut self.fog, "Distance fog");
+                    if self.fog {
+                        ui.add(
+                            egui::Slider::new(&mut self.fog_radius, 0.1..=1.0)
+                                .text("of cull radius"),
+                        );
+                    }
+
+                    ui.separator();
+                }
+
+                ui.label(format!("FPS (vsync): {:.1}", self.timestamps.fps));
+                ui.label(format!(
+                    "time per frame: {:?}",
+                    Duration::from_secs_f64(self.timestamps.render.0 + self.timestamps.wireframe.0)
+                ));
+                ui.checkbox(&mut self.show_render, "Show render times in graph");
+                egui_plot::Plot::new("")
+                    .legend(egui_plot::Legend::default())
+                    .show(ui, |plot_ui| {
+                        let mut v = Vec::new();
+                        if self.show_render {
+                            v.push((self.timestamps.render, "render"));
+                            v.push((self.timestamps.wireframe, "wireframe"));
+                        }
+                        v.extend([
+                            (self.timestamps.sdf, "sdf"),
+                            (self.timestamps.triangle_allocation, "triangle_allocation"),
+                            (self.timestamps.prefix_top, "prefix_top"),
+                            (self.timestamps.triangle_writeback, "triangle_writeback"),
+                            (self.timestamps.cull, "cull"),
+                        ]);
+                        for (i, ((mean, _), label)) in v.iter().enumerate() {
+                            let bar = egui_plot::BarChart::new(vec![egui_plot::Bar::new(
+                                i as f64, *mean,
+                            )])
+                            .name(label);
+                            plot_ui.bar_chart(bar);
+                        }
+                    });
+            });
+    }
+    fn cull_radius(&self) -> f32 {
+        if self.distance_culling {
+            self.cull_radius
+        } else {
+            f32::INFINITY
+        }
+    }
+    fn fog(&self) -> f32 {
+        if self.culling && self.fog && self.distance_culling {
+            self.fog_radius * self.cull_radius
+        } else {
+            f32::INFINITY
+        }
+    }
+}
 
 struct State<'a> {
     device: wgpu::Device,
@@ -1684,6 +2041,9 @@ struct State<'a> {
     last_time: Instant,
     last_count: u32,
     storage: Storage,
+
+    egui: EguiRenderer,
+    gui: GuiState,
 }
 impl<'a> State<'a> {
     fn new(window: &'a winit::window::Window, cube_march: &CubeMarch) -> Self {
@@ -1709,12 +2069,14 @@ impl<'a> State<'a> {
             .unwrap();
         let adapter_limits = adapter.limits();
         let surface_caps = dbg!(surface.get_capabilities(&adapter));
-        let surface_format = surface_caps
+        let surface_format = surface
+            .get_capabilities(&adapter)
             .formats
-            .iter()
-            .copied()
-            .find(|f| f.is_srgb())
-            .unwrap_or(surface_caps.formats[0]);
+            .into_iter()
+            .find(|format| format.is_srgb())
+            .unwrap();
+        // egui_wgpu::preferred_framebuffer_format(&surface.get_capabilities(&adapter).formats)
+        //     .unwrap();
 
         dbg!(adapter.features());
         dbg!(!adapter.features());
@@ -1736,7 +2098,8 @@ impl<'a> State<'a> {
                         | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES
                         | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
                         | wgpu::Features::SUBGROUP
-                        | wgpu::Features::POLYGON_MODE_LINE,
+                        | wgpu::Features::POLYGON_MODE_LINE
+                        | wgpu::Features::SHADER_F64,
                     required_limits,
                 },
                 None,
@@ -1761,7 +2124,10 @@ impl<'a> State<'a> {
 
         let camera = Camera::new(&surface_config);
 
-        let camera_buffer = MetaBuffer::new_uniform(&device, UNIFORM | COPY_DST, &camera.uniform());
+        let gui_state = GuiState::new();
+
+        let camera_buffer =
+            MetaBuffer::new_uniform(&device, UNIFORM | COPY_DST, &camera.uniform(&gui_state));
 
         let depth_texture = Texture::new_depth(&device, &surface_config);
 
@@ -1836,6 +2202,9 @@ impl<'a> State<'a> {
         let last_time = Instant::now();
         let last_count = 0;
         let t0 = Instant::now();
+
+        let egui = EguiRenderer::new(&device, surface_format, window);
+
         Self {
             device,
             queue,
@@ -1852,9 +2221,16 @@ impl<'a> State<'a> {
             bitpack_bind_group,
             storage,
             wireframe_render_pipeline,
+            egui,
+            gui: gui_state,
         }
     }
-    fn render(&mut self, held_keys: &BTreeSet<KeyCode>, pressed_keys: &BTreeSet<KeyCode>) {
+    fn draw(
+        &mut self,
+        window: &'a winit::window::Window,
+        held_keys: &BTreeSet<KeyCode>,
+        pressed_keys: &BTreeSet<KeyCode>,
+    ) {
         let dt = replace(&mut self.t0, Instant::now())
             .elapsed()
             .as_secs_f32();
@@ -1865,10 +2241,20 @@ impl<'a> State<'a> {
             .dispatch(&self.device, &self.queue, self.camera.pos);
         let mut first = true;
 
-        self.storage.cull(&self.device, &self.queue);
+        if self.gui.culling {
+            self.storage.cull(&mut encoder);
+        }
 
-        if true {
-            let pipeline = self.bitpack_render_pipeline.get(&self.device);
+        //let clear_color = wgpu::Color { r: 0.1, g: 0.2, b: 0.3, a: 1.0, };
+        let clear_color = wgpu::Color {
+            r: 0.2,
+            g: 0.1,
+            b: 0.2,
+            a: 1.0,
+        };
+
+        if self.gui.filled {
+            let (timestamp_writes, pipeline) = self.bitpack_render_pipeline.get(&self.device);
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1876,12 +2262,7 @@ impl<'a> State<'a> {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: if first {
-                            wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 0.1,
-                                g: 0.2,
-                                b: 0.3,
-                                a: 1.0,
-                            })
+                            wgpu::LoadOp::Clear(clear_color)
                         } else {
                             wgpu::LoadOp::Load
                         },
@@ -1900,17 +2281,17 @@ impl<'a> State<'a> {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes,
                 occlusion_query_set: None,
             });
             render_pass.set_pipeline(pipeline);
             render_pass.set_bind_group(0, &self.bitpack_bind_group, &[]);
-            self.storage.draw(&mut render_pass, true);
+            self.storage.draw(&mut render_pass, self.gui.culling);
             first = false;
         }
 
-        if false {
-            let pipeline = self.wireframe_render_pipeline.get(&self.device);
+        if self.gui.wireframe {
+            let (timestamp_writes, pipeline) = self.wireframe_render_pipeline.get(&self.device);
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1918,12 +2299,7 @@ impl<'a> State<'a> {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: if first {
-                            wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 0.1,
-                                g: 0.2,
-                                b: 0.3,
-                                a: 1.0,
-                            })
+                            wgpu::LoadOp::Clear(clear_color)
                         } else {
                             wgpu::LoadOp::Load
                         },
@@ -1942,13 +2318,30 @@ impl<'a> State<'a> {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes,
                 occlusion_query_set: None,
             });
             render_pass.set_pipeline(pipeline);
             render_pass.set_bind_group(0, &self.bitpack_bind_group, &[]);
-            self.storage.draw(&mut render_pass, false);
+            self.storage.draw(&mut render_pass, self.gui.culling);
             first = false;
+        }
+
+        {
+            let screen_descriptor = egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [self.surface_config.width, self.surface_config.height],
+                pixels_per_point: window.scale_factor() as f32,
+            };
+
+            self.egui.draw(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                window,
+                &view,
+                screen_descriptor,
+                |ui| self.gui.run(ui),
+            );
         }
 
         self.camera
@@ -1961,11 +2354,11 @@ impl<'a> State<'a> {
         // )
         //     .into();
         // self.camera.eye *= 32.0;
-        self.camera_buffer.write(&self.queue, self.camera.uniform());
-        self.queue.submit([encoder.finish()]);
-        output.present();
+        self.camera_buffer
+            .write(&self.queue, self.camera.uniform(&self.gui));
         let elapsed = self.last_time.elapsed().as_secs_f64();
         self.last_count += 1;
+
         if elapsed > 1.0 {
             let fps = self.last_count as f64 / elapsed;
             println!(
@@ -1979,7 +2372,69 @@ impl<'a> State<'a> {
 
             self.last_count = 0;
             self.last_time = Instant::now();
+
+            {
+                self.bitpack_render_pipeline.timestamp.reset();
+                self.wireframe_render_pipeline.timestamp.reset();
+
+                let mut gui_timestamps = TimeStamps::default();
+                gui_timestamps.fps = fps;
+
+                let mut timestamps = [
+                    (
+                        &mut self.bitpack_render_pipeline.timestamp,
+                        &mut gui_timestamps.render,
+                    ),
+                    (
+                        &mut self.wireframe_render_pipeline.timestamp,
+                        &mut gui_timestamps.wireframe,
+                    ),
+                    (
+                        &mut self.storage.trigen.sdf.timestamp,
+                        &mut gui_timestamps.sdf,
+                    ),
+                    (
+                        &mut self.storage.trigen.triangle_allocation.timestamp,
+                        &mut gui_timestamps.triangle_allocation,
+                    ),
+                    (
+                        &mut self.storage.trigen.prefix_top.timestamp,
+                        &mut gui_timestamps.prefix_top,
+                    ),
+                    (
+                        &mut self.storage.trigen.triangle_writeback.timestamp,
+                        &mut gui_timestamps.triangle_writeback,
+                    ),
+                    (
+                        &mut self.storage.cull_kernel.timestamp,
+                        &mut gui_timestamps.cull,
+                    ),
+                ];
+
+                for (timestamp, _) in timestamps.iter_mut() {
+                    timestamp.resolve_copy(&mut encoder);
+                }
+
+                self.queue.submit([encoder.finish()]);
+
+                for (timestamp, _) in timestamps.iter_mut() {
+                    timestamp.resolve_map();
+                }
+
+                self.device.poll(wgpu::MaintainBase::Wait);
+
+                let seconds_per_tick = self.queue.get_timestamp_period() as f64 / 1_000_000_000.0;
+
+                for (timestamp, gtime) in timestamps.iter_mut() {
+                    timestamp.resolve_unmap(seconds_per_tick);
+                    **gtime = (timestamp.mean, timestamp.sd);
+                }
+                self.gui.timestamps = gui_timestamps;
+            }
+        } else {
+            self.queue.submit([encoder.finish()]);
         }
+        output.present();
     }
     fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
         if size.width > 0 && size.height > 0 {
@@ -2018,12 +2473,13 @@ fn main() {
             Event::NewEvents(_) => (),
             Event::WindowEvent { window_id, event } => {
                 if window_id == window.id() {
+                    let egui_winit::EventResponse { consumed, .. }= state.egui.input(window, &event);
                     match event {
                         WindowEvent::CloseRequested | WindowEvent::KeyboardInput {
                             event: KeyEvent { logical_key: winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape), .. }, ..
                         } => window_target.exit(),
                         WindowEvent::RedrawRequested => {
-                            state.render(&held_keys, &pressed_keys);
+                            state.draw(window, &held_keys, &pressed_keys);
                             pressed_keys.clear();
                             window.request_redraw();
                         }

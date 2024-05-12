@@ -13,7 +13,7 @@ struct CameraUniform {
     lmap: mat4x4<f32>, // world, light
     lmap_inv: mat4x4<f32>, // light, world
     time: f32,
-    _unused0: f32,
+    radius: f32,
     _unused1: f32,
     _unused2: f32,
     cull: mat4x4<f32>,
@@ -41,7 +41,24 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     let pos = camera.cull * pos_offset;
 
-    let visible = (abs(pos.x) < pos.w) && (abs(pos.y) < pos.w) && (abs(pos.z) < pos.w);
+    var visible = true;
+
+    // distance = pos.z / pos.w
+
+    // distance < 10.0 <=> pos.z / pos.w < 10.0 <=> pos.z < pos.w * 10.0
+
+
+
+    visible = visible && (abs(pos.x) < pos.w);
+    visible = visible && (abs(pos.y) < pos.w);
+    visible = visible && pos.z > 0.0;
+    if visible {
+        // distance cull
+        let rad = camera.radius;
+        let pos_view = camera.view * pos_offset;
+        visible = visible && pos_view.z > -rad;
+        visible = visible && dot(pos_view.xyz, pos_view.xyz) < (rad * pos_view.w) * (rad * pos_view.w);
+    }
 
     if visible {
         dst_buffer[i] = src;

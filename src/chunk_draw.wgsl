@@ -17,8 +17,8 @@ struct CameraUniform {
     lmap: mat4x4<f32>, // world, light
     lmap_inv: mat4x4<f32>, // light, world
     time: f32,
-    _unused0: f32,
-    _unused1: f32,
+    radius: f32,
+    fog_inv: f32,
     _unused2: f32,
 };
 @group(0) @binding(0)
@@ -74,7 +74,7 @@ fn vs_main(
 
 @fragment
 fn fs_wire(in: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    return vec4<f32>(0.0, 0.0, 0.0, 1.0);
 }
 
 @fragment
@@ -85,8 +85,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let world_light = camera.lmap;
     let light_world = camera.lmap_inv;
 
+    let p_world0 = in.world_pos;
     let p_world = in.world_pos + camera.time * 0.1;
     let p_view = (world_view * vec4f(p_world, 1.0)).xyz;
+    let p_view0 = (world_view * vec4f(p_world0, 1.0)).xyz;
     let p_light = (world_light * vec4f(p_world, 1.0)).xyz;
     let l_light = (floor(p_light / r) + 0.5) * r;
 
@@ -101,14 +103,23 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let view_pos_dy = dpdy(p_view);
     let normal = -normalize(cross(view_pos_dx, view_pos_dy));
 
+    let up = (world_view * vec4<f32>(0.0, 1.0, 0.0, 0.0)).xyz;
+
     let lambertian = max(dot(lp_view_norm, normal), 0.0);
     let h = normalize(lp_view_norm + view_dir);
     let spec_angle = max(dot(h, normal), 0.0);
     let specular = pow(spec_angle, 10.0);
-    let color = 0.003 + lambertian * light_strength;
+    let light = 0.003 + lambertian * light_strength ;
     
     // return vec4<f32>((light_pos_world + 1.0) % 0.9, 1.0);
+    
+    let color = vec3<f32>(light, 0.0, max(dot(up, normal), 0.0));
+    let color_fog = vec3<f32>(0.2, 0.1, 0.2);
+    
+    let interpolated = mix(color, color_fog, min(dot(p_view0, p_view0) * camera.fog_inv, 1.0));
+    
 
-    return vec4<f32>(color, 1.0/length(p_view), 0.0, 1.0);
+
+    return vec4<f32>(interpolated, 1.0);
 }
 

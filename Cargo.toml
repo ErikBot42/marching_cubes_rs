@@ -7,12 +7,22 @@ edition = "2021"
 
 [dependencies]
 
+[dependencies.egui_plot]
+git = "https://github.com/emilk/egui.git"
+rev = "c3f386aa301f26106397c4e14434bd5a734ba6b6"
+
+[dependencies.egui-winit]
+git = "https://github.com/emilk/egui.git"
+rev = "c3f386aa301f26106397c4e14434bd5a734ba6b6"
+
 [dependencies.egui-wgpu]
-version = "0.27.2"
+git = "https://github.com/emilk/egui.git"
+rev = "c3f386aa301f26106397c4e14434bd5a734ba6b6"
 features = ["winit", "wayland", "x11"]
 
 [dependencies.egui]
-version = "0.27.2"
+git = "https://github.com/emilk/egui.git"
+rev = "c3f386aa301f26106397c4e14434bd5a734ba6b6"
 
 [dependencies.bytemuck]
 version = "1.15.0"

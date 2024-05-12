@@ -1,21 +1,57 @@
 
 
+fn sd_mandelbox_optim2(p00: vec3<f32>, scale: f32) -> f32 { 
+    let iters = 20;
+    let mr2 = 0.5 * 0.5;
+    let scalevec = vec4<f32>(scale, scale, scale, abs(scale)) / mr2;
+    let c1 = abs(scale- 1.0);
+    let c2 = pow(abs(scale), 1.0 - f32(iters));
+
+    var p = vec4<f32>(p00, 1.0);
+    let p0 = p;
+    for (var i=0; i<iters; i++) {
+        p = vec4<f32>(clamp(p.xyz, - vec3<f32>(1.0), vec3<f32>(1.0)) * 2.0 - p.xyz, p.w);
+        p = (p * clamp(max(mr2/dot(p.xyz, p.xyz), mr2), 0.0, 1.0)) * scalevec + p0; 
+    }
+    return (length(p.xyz) - c1) / p.w - c2;
+}
 
 fn sdf(x0: i32, y0: i32, z0: i32) -> f32 {
     // let x = (f32(x0) / 2.0);// % 30.0 - 8.0;
     // let y = (f32(y0) / 2.0);// % 30.0 - 8.0;
     // let z = (f32(z0) / 2.0);// % 30.0 - 8.0;
 
+    let sc = 32.0 * 2.0;
 
+    var pi = vec3<i32>(x0, y0, z0);
+
+
+    let layer = pi.y / (4 * 32);
+    pi %= 4 * 32;
+
+
+    var p = (vec3<f32>(pi) - sc) / (sc * 2.0);
+
+    var mandel_scale = -3.0 + (f32(layer % 9) * 0.5);
+    var scale = 0.3; 
+    if (mandel_scale > 0.0) {
+        mandel_scale+=2.0; 
+        scale/=(mandel_scale+1.0)/(mandel_scale- 1.0);
+    } else {
+        mandel_scale-=1.0;
+    }
+    return sd_mandelbox_optim2(p / scale, mandel_scale) * scale - 0.001;
+    //let p = vec3<f32>(vec3<i32>(x0, y0, z0) - 32);
+
+    //return -sd_mandelbulb3(p * (1.0 / 32.0));
+
+
+/*
     let rad = 4 * 32;
-
-
-
 
     let p = vec3<f32>(vec3<i32>(x0, y0, z0)) * (1.0/f32(32));
     let l = length(p);
     let f = 1.75;
-
 
     if false {
 
@@ -40,7 +76,7 @@ fn sdf(x0: i32, y0: i32, z0: i32) -> f32 {
     }
 
     return -1.0;
-
+*/
 }
 
 fn sd_mandelbulb3(p: vec3<f32>) -> f32 {
