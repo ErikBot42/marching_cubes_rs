@@ -14,7 +14,7 @@ use cgmath::{
 use winit::keyboard::KeyCode;
 
 use pollster::FutureExt;
-use wgpu::util::DeviceExt;
+use wgpu::util::{DeviceExt, RenderEncoder};
 use winit::{event::*, event_loop::EventLoop, window::WindowBuilder};
 
 use std::{
@@ -61,67 +61,6 @@ macro_rules! source {
     }};
 }
 
-mod cull {
-    // https://gdbooks.gitbooks.io/3dcollisions/content/Chapter6/frustum.html
-    use super::*;
-    #[repr(C)]
-    #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-    struct Plane {
-        n: [f32; 3],
-        d: f32,
-    }
-    impl Plane {
-        fn new(v: Vector4<f32>) -> Self {
-            let w = v.w;
-            let v = v.truncate();
-            let m2 = v.magnitude2();
-
-            // ASSUME: v is normalized
-
-            Self {
-                n: (v / m2).into(),
-                d: w / m2.sqrt(),
-            }
-        }
-        fn outside(&self, p: Vector3<f32>) -> bool {
-            dot(self.n.into(), p) > self.d
-        }
-    }
-    #[repr(C)]
-    #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-    pub(crate) struct Frustrum([Plane; 6]);
-    impl Frustrum {
-        // TODO: constrain far plane for distance culling.
-        // need OpenGl view-projection matrix
-        pub(crate) fn new(view_proj: Matrix4<f32>) -> Self {
-            let m = view_proj.transpose();
-            Self(
-                [
-                    m.w + m.x,
-                    m.w - m.x,
-                    m.w + m.y,
-                    m.w - m.y,
-                    m.w + m.z,
-                    m.w - m.z,
-                ]
-                .map(Plane::new),
-            )
-        }
-        fn aabb_outside(&self, min: Vector3<f32>, max: Vector3<f32>) -> bool {
-            self.0.iter().any(|p| {
-                [min.x, max.x].into_iter().all(|x| {
-                    [min.y, max.y].into_iter().all(|y| {
-                        [min.z, max.z]
-                            .into_iter()
-                            .all(|z| p.outside(Vector3 { x, y, z }))
-                    })
-                })
-            })
-        }
-    }
-}
-use cull::Frustrum;
-
 // MSB                          LSB
 // 00000000000000000000000000000000
 //   ZZZZZZZZZZYYYYYYYYYYXXXXXXXXXX vertex % 3
@@ -163,6 +102,10 @@ impl From<wgpu::util::DrawIndirectArgs> for DrawIndirectArgs2 {
     }
 }
 
+fn pos_to_target(pos: Point3<f64>) -> Point3<u32> {
+    (pos).map(|f| ((f / 2.0) as i32).max(0).min(1023) as u32)
+}
+
 #[derive(Debug)]
 struct DataEntry {
     offset: u32,
@@ -189,14 +132,12 @@ struct Storage {
     data_entries_written: usize,
     indirect_draw_buffer: MetaBuffer,
     culled_indirect_draw_buffer: MetaBuffer,
-    query: Option<QuerySetState<MarkerStart>>,
     cull_kernel: Kernel,
 }
 impl Storage {
     fn new(device: &wgpu::Device, cube_march: &CubeMarch, camera_buffer: &MetaBuffer) -> Self {
         let (send, recv) = std::sync::mpsc::channel();
-        // 128 MiB = 134 million triangles
-        let capacity: u32 = 32 * 1024 * 1024;
+        let capacity: u32 = 128 * 1024 * 1024;
         // let capacity: u32 = 511 * 1024 * 1024;
         let b0 = MetaBuffer::new_uninit(device, "b0", STORAGE | VERTEX, (capacity as u64) * 4);
         let data = Vec::new();
@@ -238,7 +179,6 @@ impl Storage {
         );
 
         let data_entries_written = 0;
-        let query = Some(QuerySetState::new(device));
         Self {
             b0,
             data,
@@ -253,21 +193,13 @@ impl Storage {
             capacity,
             data_entries_written,
             indirect_draw_buffer,
-            query,
             culled_indirect_draw_buffer,
             cull_kernel,
         }
     }
-    fn dispatch(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, pos: Point3<f32>) {
-        let pos = (pos).map(|f| ((f / 2.0) as i32).max(0).min(1023) as u32);
+    fn dispatch(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, pos: Point3<u32>) {
         let target: (u32, u32, u32) = (pos.x, pos.y, pos.z);
-        //dbg!(pos);
         let radius = 5;
-
-        self.query = self.query.take().map(|mut q| {
-            q.resolve(device, queue);
-            q
-        });
 
         if self.capacity < self.offset + MAX_TRIS_PER_CHUNK {
             return;
@@ -284,19 +216,17 @@ impl Storage {
                 }
             }
         }
-
-        for _ in 0..4 {
+        for _ in 0..16 {
             if self.capacity < self.offset + MAX_TRIS_PER_CHUNK {
                 break;
             }
             let Some((x, y, z)) = self.compute_queue.pop_front() else {
                 break;
             };
-            //dbg!(&self.compute_queue);
 
             if let Some((x, y, z)) = self.awaiting.take() {
                 device.poll(wgpu::Maintain::Wait); // :(
-                let _: () = self.recv.recv().unwrap().unwrap(); // TODO: read and unmap in callback.
+                let _: () = self.recv.recv().unwrap().unwrap();
                 let count = bytemuck::cast_slice::<u8, u32>(
                     &self
                         .count_staging_buffer
@@ -328,24 +258,9 @@ impl Storage {
             self.trigen.chunk.write(queue, chunk);
 
             let mut encoder = device.create_command_encoder(&default());
-            let query = self.query.take();
-            let query = query.map(|q| q.encoder(&mut encoder));
-            let query = self
-                .trigen
-                .dispatch(&mut encoder, &self.count_staging_buffer, query);
-            let query = query.map(|q| q.encoder(&mut encoder));
-            self.query = query;
+            self.trigen
+                .dispatch(&mut encoder, &self.count_staging_buffer);
             queue.submit([encoder.finish()]); // submit needed to map buffer later.
-
-            // {
-            //     self.trigen.inspect_buffer.buffer.slice(..).map_async(wgpu::MapMode::Read, |_| ());
-            //     device.poll(wgpu::MaintainBase::Wait);
-            //     let tmp = self.trigen.inspect_buffer.buffer.slice(..).get_mapped_range();
-            //     let range: &[u32] = bytemuck::cast_slice(&tmp);
-            //     println!("{:?}", &range[1..129]);
-            //     drop(tmp);
-            //     panic!();
-            // }
 
             self.awaiting = Some((x, y, z));
             let sender = self.send.clone();
@@ -510,7 +425,7 @@ impl TriWriteBackUniform {
 
 wgsl_uniform!(RenderCaseUniform RENDER_CASE_UNIFORM
     /// XYZ XYZ XYZ XYZ XYZ XYZ = 18 bit
-    triangle_to_corners: [u32; 188], // 135
+    triangle_to_corners: [u32; 190], // 135
 );
 impl RenderCaseUniform {
     fn new(case: &CubeMarch) -> Self {
@@ -529,8 +444,6 @@ impl RenderCaseUniform {
 struct MetaBuffer {
     buffer: wgpu::Buffer,
     bytes: u64,
-    ty: wgpu::BufferBindingType,
-    // TODO: visibility
 }
 impl MetaBuffer {
     fn new<T: bytemuck::NoUninit>(
@@ -542,7 +455,6 @@ impl MetaBuffer {
         Self::new_i(
             device,
             name,
-            wgpu::BufferBindingType::Storage { read_only: false },
             wgpu::BufferUsages::STORAGE | flags,
             bytemuck::cast_slice(contents),
         )
@@ -556,7 +468,6 @@ impl MetaBuffer {
         Self::new_i(
             device,
             name,
-            wgpu::BufferBindingType::Storage { read_only: true },
             wgpu::BufferUsages::STORAGE | flags,
             bytemuck::cast_slice(contents),
         )
@@ -569,7 +480,6 @@ impl MetaBuffer {
         Self::new_i(
             device,
             &format!("{} uniform buffer", std::any::type_name::<T>()),
-            wgpu::BufferBindingType::Uniform,
             // wgpu::BufferUsages::COPY_DST
             wgpu::BufferUsages::UNIFORM | flags,
             bytemuck::cast_slice(from_ref(data)),
@@ -588,16 +498,11 @@ impl MetaBuffer {
             mapped_at_creation: false,
         });
 
-        Self {
-            buffer,
-            bytes,
-            ty: wgpu::BufferBindingType::Storage { read_only: false },
-        }
+        Self { buffer, bytes }
     }
     fn new_i(
         device: &wgpu::Device,
         name: &str,
-        ty: wgpu::BufferBindingType,
         usage: wgpu::BufferUsages,
         contents: &[u8],
     ) -> Self {
@@ -609,7 +514,6 @@ impl MetaBuffer {
         Self {
             buffer,
             bytes: contents.len() as u64,
-            ty,
         }
     }
     fn binding_layout(
@@ -759,24 +663,16 @@ struct TriGenState {
     sdf_data: MetaBuffer,
     /// `33^3 + 415`
     sdf: Kernel,
-    /// [u32; 257]
-    //case_triangle_count: MetaBuffer,
     /// `32^3`
     triangle_allocation: Kernel,
     /// [u32; 32^3 + 1]
     triangle_count_prefix: MetaBuffer,
     /// `256`
     prefix_top: Kernel,
-    /// `[u32]`
-    //case_triangle_offset: MetaBuffer,
-    /// `[u32]`
-    //case_triangle_number: MetaBuffer,
     /// `32^3`
     triangle_writeback: Kernel,
     staging_buffer: MetaBuffer,
     render_case_uniform: MetaBuffer,
-    // query_buffer0: MetaBuffer,
-    // query_buffer1: MetaBuffer,
     inspect_buffer: MetaBuffer,
 }
 
@@ -836,63 +732,16 @@ impl TriGenState {
         }
 
     }
-    fn dispatch(
-        &mut self,
-        encoder: &mut wgpu::CommandEncoder,
-        staging_buffer: &MetaBuffer,
-        query: Option<QuerySetState<MarkerPrePass>>,
-        //mut qset: Option<&mut QuerySetState>,
-    ) -> Option<QuerySetState<MarkerPostCompute>> {
-        // let mut encoder = device.create_command_encoder(&default());
-        //encoder.write_timestamp(qset, 0);
+    fn dispatch(&mut self, encoder: &mut wgpu::CommandEncoder, staging_buffer: &MetaBuffer) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: None,
             timestamp_writes: None,
         });
-        // if let Some(q) = &mut qset {
-        //     q.pass(&mut pass);
-        // }
-        let query = query.map(|q| q.pass(&mut pass));
         self.sdf.dispatch(&mut pass);
-        // if let Some(q) = &mut qset {
-        //     q.pass(&mut pass);
-        // }
-        let query = query.map(|q| q.pass(&mut pass));
         self.triangle_allocation.dispatch(&mut pass);
-        //if let Some(q) = &mut qset {
-        //    q.pass(&mut pass);
-        //}
-        // drop(pass);
-
-        // {
-        //     encoder.copy_buffer_to_buffer(
-        //         &self.triangle_count_prefix.buffer,
-        //         0,
-        //         &self.inspect_buffer.buffer,
-        //         0,
-        //         self.triangle_count_prefix.bytes,
-        //     );
-        // }
-
-        // let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        //     label: None,
-        //     timestamp_writes: None,
-        // });
-        let query = query.map(|q| q.pass(&mut pass));
         self.prefix_top.dispatch(&mut pass);
-        //if let Some(q) = &mut qset {
-        //    q.pass(&mut pass);
-        //}
-        let query = query.map(|q| q.pass(&mut pass));
         self.triangle_writeback.dispatch(&mut pass);
-        let query = query.map(|q| q.pass(&mut pass));
-        //if let Some(q) = &mut qset {
-        //    q.pass(&mut pass);
-        //}
         drop(pass);
-
-        //encoder.write_timestamp(qset, 1);
-
         encoder.copy_buffer_to_buffer(
             &self.triangle_count_prefix.buffer,
             (32 * 32 * 32) * 4,
@@ -900,332 +749,6 @@ impl TriGenState {
             0,
             4,
         );
-        query
-    }
-}
-struct QuerySetState<T: Seq> {
-    set: wgpu::QuerySet,
-    resolve_buffer: wgpu::Buffer,
-    staging_buffer: wgpu::Buffer,
-    i: u32,
-    stats: Stats,
-    _phantom: std::marker::PhantomData<T>,
-}
-impl<T: Seq> QuerySetState<T> {
-    fn next(mut self) -> QuerySetState<T::Next> {
-        self.i += 1;
-        let Self {
-            set,
-            resolve_buffer,
-            staging_buffer,
-            i,
-            stats,
-            _phantom,
-        } = self;
-        QuerySetState {
-            set,
-            resolve_buffer,
-            staging_buffer,
-            i,
-            stats,
-            _phantom: std::marker::PhantomData,
-        }
-    }
-    fn pass(self, pass: &mut wgpu::ComputePass) -> QuerySetState<T::Next> {
-        pass.write_timestamp(&self.set, self.i);
-        self.next()
-    }
-    fn encoder(self, encoder: &mut wgpu::CommandEncoder) -> QuerySetState<T::Next> {
-        encoder.write_timestamp(&self.set, self.i);
-        self.next()
-    }
-}
-impl QuerySetState<MarkerStart> {
-    fn new(device: &wgpu::Device) -> Self {
-        let set = device.create_query_set(&wgpu::QuerySetDescriptor {
-            label: Some("query set"),
-            ty: wgpu::QueryType::Timestamp,
-            count: wgpu::QUERY_SET_MAX_QUERIES,
-        });
-        let i = 0;
-        let size = wgpu::QUERY_SET_MAX_QUERIES as u64 * size_of::<u64>() as u64;
-
-        let resolve_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("resolve buffer"),
-            size,
-            usage: COPY_SRC | QUERY_RESOLVE,
-            mapped_at_creation: false,
-        });
-        let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("resolve buffer"),
-            size,
-            usage: COPY_DST | MAP_READ,
-            mapped_at_creation: false,
-        });
-        let stats = Stats::new();
-        Self {
-            set,
-            i,
-            resolve_buffer,
-            staging_buffer,
-            stats,
-            _phantom: std::marker::PhantomData,
-        }
-    }
-    fn need_resolve(&self) -> bool {
-        self.i < wgpu::QUERY_SET_MAX_QUERIES / 2
-    }
-    fn resolve(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        if self.i == 0 {
-            return;
-        }
-        let mut encoder = device.create_command_encoder(&default());
-        encoder.resolve_query_set(&self.set, 0..self.i, &self.resolve_buffer, 0);
-
-        let bytes = self.i as u64 * size_of::<u64>() as u64;
-
-        encoder.copy_buffer_to_buffer(&self.resolve_buffer, 0, &self.staging_buffer, 0, bytes);
-
-        queue.submit([encoder.finish()]);
-
-        self.staging_buffer
-            .slice(0..bytes)
-            .map_async(wgpu::MapMode::Read, |_| ());
-
-        device.poll(wgpu::MaintainBase::Wait);
-
-        let tmp = self.staging_buffer.slice(0..bytes).get_mapped_range();
-        let data: &[QueryRaw] = bytemuck::cast_slice(&tmp);
-
-        //dbg!(data);
-
-        let seconds_per_tick = (queue.get_timestamp_period() as f64) / 1_000_000_000.0;
-
-        for d in data {
-            let query = d.query(seconds_per_tick);
-            self.stats.add(query);
-        }
-        drop(tmp);
-
-        self.staging_buffer.unmap();
-
-        self.i = 0;
-    }
-}
-
-trait Seq {
-    type Next: Seq;
-}
-macro_rules! seq {
-    ($query:ident $raw:ident $start:ident $($a:ident $c:ident)*) => {
-        $(struct $a;)*
-        #[repr(C)]
-        #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-        struct $raw { $($c: u64,)* }
-        #[derive(Debug, Default, Copy, Clone)]
-        struct $query { $($c: f64,)* }
-        seq!($start [$($a)*]);
-        seq!($query $raw ($($c)*));
-        impl std::ops::AddAssign<$query> for $query { fn add_assign(&mut self, rhs: $query) { $(self.$c += rhs.$c;)* } }
-        impl std::ops::Mul<$query> for $query { type Output = $query; fn mul(self, rhs: $query) -> Self::Output { Self { $($c: self.$c * rhs.$c,)* } } }
-        impl std::ops::Div<$query> for $query { type Output = $query; fn div(self, rhs: $query) -> Self::Output { Self { $($c: self.$c / rhs.$c,)* } } }
-        impl std::ops::Add<$query> for $query { type Output = $query; fn add(self, rhs: $query) -> Self::Output { Self { $($c: self.$c + rhs.$c,)* } } }
-        impl std::ops::Sub<$query> for $query { type Output = $query; fn sub(self, rhs: $query) -> Self::Output { Self { $($c: self.$c - rhs.$c,)* } } }
-        impl std::ops::Mul<f64> for $query { type Output = $query; fn mul(self, rhs: f64) -> Self::Output { Self { $($c: self.$c * rhs,)* } } }
-        impl std::ops::Div<f64> for $query { type Output = $query; fn div(self, rhs: f64) -> Self::Output { Self { $($c: self.$c / rhs,)* } } }
-        impl std::ops::Add<f64> for $query { type Output = $query; fn add(self, rhs: f64) -> Self::Output { Self { $($c: self.$c + rhs,)* } } }
-        impl std::ops::Sub<f64> for $query { type Output = $query; fn sub(self, rhs: f64) -> Self::Output { Self { $($c: self.$c - rhs,)* } } }
-        impl $query { fn sqrt(self) -> $query { Self { $($c: self.$c.sqrt(),)* } } }
-        impl $query {
-            fn disp_mean_sd(mean: $query, sd: $query) {
-                println!("Query {{");
-                $(println!(
-                    concat!( "    ", stringify!($c), ": {:?} +- {:?}"),
-                    Duration::from_secs_f64(mean.$c),
-                    Duration::from_secs_f64(sd.$c)
-                );)*
-                println!("}}");
-            }
-        }
-    };
-    ($query:ident $raw:ident ($a:ident $($as:ident)*)) => { seq!($query $raw ($a $($as)*), ($($as)* $a)); };
-    ($query:ident $raw:ident ($($as:ident)*), ($($bs:ident)*)) => {
-        impl $raw {
-            fn query(self, seconds_per_tick: f64) -> $query {
-                $( let $as = (self.$as as f64) * seconds_per_tick;)*
-                $query {$(
-                    $bs: ($bs - $as).abs(),
-                )*}
-            }
-        }
-    };
-    ($start:ident [$a:ident $($as:ident)*]) => {
-        type $start = $a;
-        seq!([$a $($as)*], [$($as)* $a]);
-    };
-    ([$($as:ident)*], [$($bs:ident)*]) => { $(impl Seq for $as { type Next = $bs; })* }
-}
-
-#[derive(Default)]
-struct Stats {
-    samples: u64,
-    s0: u64,
-    s1: Query,
-    s2: Query,
-}
-impl Stats {
-    fn new() -> Self {
-        Self::default()
-    }
-    fn add(&mut self, query: Query) {
-        self.samples += 1;
-        if self.samples > 200 {
-            self.s0 += 1;
-            self.s1 += query;
-            self.s2 += query * query;
-        }
-    }
-    fn display(&self) {
-        let Self {
-            s0,
-            s1,
-            s2,
-            samples: _,
-        } = *self;
-        if s0 < 5 {
-            return;
-        }
-        let s0 = s0 as f64;
-        let mean = s1 / s0;
-        let sd = ((s2 * s0 - s1 * s1) / (s0 * (s0 - 1.0))).sqrt();
-        Query::disp_mean_sd(mean, sd);
-    }
-}
-seq!(Query QueryRaw MarkerStart
-    MarkerPreCompute pre_compute
-    MarkerPrePass pre_pass
-    MarkerSdf sdf
-    MarkerTriangleAllocation triangle_allocation
-    MarkerPrefixTop prefix_top
-    MarkerTriangleWriteback triangle_writeback
-    MarkerPostCompute post_compute
-);
-
-// copy -> map_async
-//
-// draw
-//
-// resolve
-// map_get
-// unmap
-
-// copy_map_async();
-//
-// begin();
-//
-// render();
-//
-// end();
-//
-// if ... { take(); }
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct RawRenderQuery {
-    vertex_shader_invocations: u64,
-    clipper_invocations: u64,
-    clipper_primitives_out: u64,
-    fragment_shader_invocations: u64,
-}
-
-// wgpu call -> DynContext -> Context ->
-
-struct RenderQueryState {
-    qset: wgpu::QuerySet,
-    staging: Arc<wgpu::Buffer>,
-    resolve: wgpu::Buffer,
-    mtx: Arc<Mutex<Option<RawRenderQuery>>>,
-    should_query: bool,
-}
-impl RenderQueryState {
-    fn new(device: &wgpu::Device) -> Self {
-        let qset = device.create_query_set(&wgpu::QuerySetDescriptor {
-            label: Some("render query set"),
-            ty: wgpu::QueryType::PipelineStatistics(
-                wgpu::PipelineStatisticsTypes::VERTEX_SHADER_INVOCATIONS
-                    | wgpu::PipelineStatisticsTypes::CLIPPER_INVOCATIONS
-                    | wgpu::PipelineStatisticsTypes::CLIPPER_PRIMITIVES_OUT
-                    | wgpu::PipelineStatisticsTypes::FRAGMENT_SHADER_INVOCATIONS,
-            ),
-            count: 1,
-        });
-        let size = size_of::<RawRenderQuery>() as u64;
-        let staging = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("render query staging buffer"),
-            size,
-            usage: MAP_READ | COPY_DST,
-            mapped_at_creation: false,
-        }));
-        let resolve = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("render query resolve buffer"),
-            size,
-            usage: COPY_SRC | QUERY_RESOLVE,
-            mapped_at_creation: false,
-        });
-        let mtx = Arc::new(Mutex::new(None));
-        let should_query = true;
-        Self {
-            qset,
-            staging,
-            resolve,
-            mtx,
-            should_query,
-        }
-    }
-    fn begin(&mut self, pass: &mut wgpu::RenderPass) {
-        if self.should_query {
-            pass.begin_pipeline_statistics_query(&self.qset, 0);
-        }
-    }
-    fn end(&mut self, pass: &mut wgpu::RenderPass) {
-        if self.should_query {
-            pass.end_pipeline_statistics_query();
-        }
-    }
-    fn copy_map_async(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        if self.should_query {
-            let mut encoder = device.create_command_encoder(&default());
-            encoder.copy_buffer_to_buffer(
-                &self.resolve,
-                0,
-                &self.staging,
-                0,
-                size_of::<RawRenderQuery>() as u64,
-            );
-            queue.submit([encoder.finish()]);
-            let staging_clone = Arc::clone(&self.staging);
-            let mtx = self.mtx.clone();
-            self.staging
-                .slice(..)
-                .map_async(wgpu::MapMode::Read, move |r| {
-                    r.unwrap();
-                    let res: RawRenderQuery = {
-                        let tmp = staging_clone.slice(..).get_mapped_range();
-                        let res: &[RawRenderQuery] = bytemuck::cast_slice(&tmp);
-                        res[0]
-                    };
-                    staging_clone.unmap();
-                    *mtx.lock().unwrap() = Some(res);
-                });
-            self.should_query = false;
-        }
-    }
-    fn take(&mut self) -> Option<RawRenderQuery> {
-        let tmp = self.mtx.lock().unwrap().take();
-        if tmp.is_some() {
-            self.should_query = true;
-        }
-        tmp
     }
 }
 
@@ -1237,39 +760,71 @@ impl RenderQueryState {
 // passes:
 // gen verts/cell + start prefix sum
 
-#[repr(C)]
-#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct CameraUniform {
-    view: [[f32; 4]; 4],
-    view_proj: [[f32; 4]; 4],
-    lmap: [[f32; 4]; 4],
-    lmap_inv: [[f32; 4]; 4],
-    time1: f32,
-    cull_radius: f32,
-    fog_inv: f32,
-    _unused2: f32,
-    cull: [[f32; 4]; 4],
+macro_rules! uniform_magic {
+    (struct $name:ident { $($field_name:ident : $t0:tt $(< $t1:tt $(,$t2:tt)?>)? ,)* }) => {
+        unsafe impl bytemuck::NoUninit for $name {}
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        struct $name { $( $field_name : uniform_magic!($t0 $(, $t1 $(, $t2)?)?),)* }
+    };
+    (array, $t:tt, $l:tt) => {[uniform_magic!($t); $l]};
+    (mat4x4, $t:tt) => {[[uniform_magic!($t); 4]; 4]};
+    (vec3, $t:tt) => {[uniform_magic!($t); 4]};
+    (vec4, $t:tt) => {[uniform_magic!($t); 4]};
+    (u32) => {u32};
+    (i32) => {i32};
+    (f32) => {f32};
 }
-struct Camera {
-    pos: cgmath::Point3<f32>,
-    dir: cgmath::Quaternion<f32>,
 
-    vel: cgmath::Vector3<f32>,
-    rvel: cgmath::Quaternion<f32>,
+uniform_magic!(
+    struct CameraUniform {
+        world_view: mat4x4<f32>,  // AKA view
+        view_world: mat4x4<f32>,  // AKA view_inv
+
+        world_clipw: mat4x4<f32>, // AKA view_proj
+        clipw_world: mat4x4<f32>, // AKA view_proj_inv
+        clipw_view: mat4x4<f32>,
+
+        world_light: mat4x4<f32>,
+        light_world: mat4x4<f32>,
+
+        time: f32,
+        cull_radius: f32,
+        fog_inv: f32,
+        _unused2: f32,
+
+        world_clipw_cull: mat4x4<f32>,
+
+        fog_color: vec3<f32>,
+        diffuse_color: vec3<f32>,
+        specular_color: vec3<f32>,
+        light_color: vec3<f32>,
+        sun_color: vec3<f32>,
+
+        base_offset: vec3<i32>,
+    }
+);
+
+struct Camera {
+    pos: cgmath::Point3<f64>,
+    dir: cgmath::Quaternion<f64>,
+
+    vel: cgmath::Vector3<f64>,
+    rvel: cgmath::Quaternion<f64>,
 
     debug_above: bool,
 
-    time: f32,
+    time: f64,
 
-    //vel: cgmath::Vector3<f32>,
-    aspect: f32,
-    fovy: f32,
-    znear: f32,
-    zfar: f32,
+    //vel: cgmath::Vector3<f64>,
+    aspect: f64,
+    fovy: f64,
+    znear: f64,
+    zfar: f64,
 }
 impl Camera {
     #[rustfmt::skip]
-    const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::new(
+    const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f64> = cgmath::Matrix4::new(
         1.0, 0.0, 0.0, 0.0,
         0.0, 1.0, 0.0, 0.0,
         0.0, 0.0, 0.5, 0.5,
@@ -1283,22 +838,20 @@ impl Camera {
         // projection matrix
         self.uniform_from_view(view, gui)
     }
-    fn view_cull(&self) -> Matrix4<f32> {
+    fn view_cull(&self) -> Matrix4<f64> {
         let b = Matrix4::from(Matrix3::from(Basis3::from_quaternion(&self.dir)));
-        let view = b * Matrix4::from_translation(-self.pos.to_vec());
+        let view = b * Matrix4::from_translation(
+            -(self.pos.to_vec() - self.base_offset().map(|v| 2.0 * v as f64).to_vec()),
+        );
         view
     }
-    fn view(&self) -> Matrix4<f32> {
-        if self.debug_above {
-            let b = Matrix4::from(Matrix3::from_angle_x(Deg(90.0)));
-            let view = b * Matrix4::from_translation(-self.pos.to_vec());
-            view
-        } else {
-            self.view_cull()
-        }
+    fn base_offset(&self) -> Point3<i32> {
+        self.pos.map(|x| (x * 0.5) as i32)
     }
-    fn uniform_from_view(&self, view: Matrix4<f32>, gui: &GuiState) -> CameraUniform {
+    fn uniform_from_view(&self, view: Matrix4<f64>, gui: &GuiState) -> CameraUniform {
         let view_projection = self.proj_view_wgpu();
+
+        let proj = Self::OPENGL_TO_WGPU_MATRIX * self.proj();
 
         let lmap = Matrix4::from_angle_x(Deg(34.4523423))
             * Matrix4::from_angle_y(Deg(47.3478))
@@ -1313,21 +866,43 @@ impl Camera {
                 z: -4.0,
             })
             * Matrix4::from(Matrix3::from(Basis3::from_quaternion(&self.dir)))
-            * Matrix4::from_translation(-self.pos.to_vec());
+            * Matrix4::from_translation(
+                -(self.pos.to_vec() - self.base_offset().map(|v| 2.0 * v as f64).to_vec()),
+            );
 
+        fn expand_v(a: Point3<i32>) -> [i32; 4] {
+            [a.x, a.y, a.z, 0]
+        }
+        fn expand(a: [u8; 3]) -> [f32; 4] {
+            let a = a.map(|a| (a as f32) / 255.0);
+            [a[0], a[1], a[2], 0.0]
+        }
+        fn conv_mat(m: Matrix4<f64>) -> [[f32; 4]; 4] {
+            let m: [[f64; 4]; 4] = m.into();
+            m.map(|m| m.map(|m| m as f32))
+        }
         CameraUniform {
-            view: view.into(),
-            view_proj: view_projection.into(),
-            lmap: lmap.into(),
-            lmap_inv: lmap_inv.into(),
-            time1: self.time,
+            world_view: conv_mat(view),
+            view_world: conv_mat(view.invert().unwrap()),
+            world_clipw: dbg!(conv_mat(view_projection)),
+            clipw_world: conv_mat(view_projection.invert().unwrap()),
+            world_light: lmap.into(),
+            light_world: lmap_inv.into(),
+            time: self.time as f32,
             cull_radius: gui.cull_radius(),
             fog_inv: 1.0 / gui.fog().powi(2),
             _unused2: 0.0,
-            cull: cull.into(),
+            world_clipw_cull: conv_mat(cull),
+            fog_color: expand(gui.fog_color),
+            diffuse_color: expand(gui.diffuse_color),
+            specular_color: expand(gui.specular_color),
+            light_color: expand(gui.light_color),
+            sun_color: expand(gui.sun_color),
+            clipw_view: conv_mat(proj.invert().unwrap()),
+            base_offset: expand_v(self.base_offset()),
         }
     }
-    fn proj(&self) -> Matrix4<f32> {
+    fn proj(&self) -> Matrix4<f64> {
         let proj = cgmath::perspective(
             cgmath::Deg((&self).fovy),
             (&self).aspect,
@@ -1336,19 +911,13 @@ impl Camera {
         );
         proj
     }
-    fn proj_view_cull(&self) -> Matrix4<f32> {
-        self.proj() * self.view_cull()
-    }
-    fn proj_view(&self) -> Matrix4<f32> {
-        self.proj() * self.view()
-    }
-    fn proj_view_wgpu(&self) -> Matrix4<f32> {
+    fn proj_view_wgpu(&self) -> Matrix4<f64> {
         Self::OPENGL_TO_WGPU_MATRIX * self.proj() * self.view_cull()
     }
     fn new(surface_config: &wgpu::SurfaceConfiguration) -> Self {
         Self {
-            pos: Point3::from((1.0, 1.0, 1.0)) * 32.0,
-            aspect: surface_config.width as f32 / surface_config.height as f32,
+            pos: Point3::from((2.0, 2.0, 2.0)) * 2.0 * 1.0 * 256.0,
+            aspect: surface_config.width as f64 / surface_config.height as f64,
             fovy: 45.0,
             znear: 0.01,
             zfar: 100.0,
@@ -1373,16 +942,18 @@ impl Camera {
     fn update(
         &mut self,
         surface_config: &wgpu::SurfaceConfiguration,
-        dt: f32,
+        dt: f64,
         held_keys: &BTreeSet<KeyCode>,
-        pressed_keys: &BTreeSet<KeyCode>,
+        _pressed_keys: &BTreeSet<KeyCode>,
     ) {
-        let dt = dt.max(0.004).min(0.1);
+        let dt = dt.max(0.0004).min(0.5);
         self.time += dt;
-        self.aspect = surface_config.width as f32 / surface_config.height as f32;
-        use KeyCode::{KeyA, KeyD, KeyI, KeyJ, KeyK, KeyL, KeyS, KeyU, KeyW, ShiftLeft, Space, KeyO};
+        self.aspect = surface_config.width as f64 / surface_config.height as f64;
+        use KeyCode::{
+            KeyA, KeyD, KeyI, KeyJ, KeyK, KeyL, KeyO, KeyS, KeyU, KeyW, ShiftLeft, Space,
+        };
 
-        let held = |key: KeyCode| held_keys.contains(&key) as u8 as f32;
+        let held = |key: KeyCode| held_keys.contains(&key) as u8 as f64;
 
         let delta = Vector3 {
             x: held(KeyD) - held(KeyA),
@@ -1399,10 +970,10 @@ impl Camera {
         let tmp_basis = Matrix3::from(tmp_basis);
 
         // self.pos += (tmp_basis.invert().unwrap() * delta) * dt * 10.0;
-        self.vel += (tmp_basis.invert().unwrap() * delta) * dt * 5.0;
+        self.vel += (tmp_basis.invert().unwrap() * delta) * dt * 4.0;
         if self.vel.magnitude() > 0.0001 {
-            self.vel -= self.vel * 0.05;
-            self.vel -= self.vel.normalize() * dot(self.vel, self.vel) * 0.005;
+            self.vel -= self.vel * 0.05 * dt * 60.0;
+            self.vel -= self.vel.normalize() * dot(self.vel, self.vel) * 0.005 * dt * 60.0;
         } else {
             self.vel = (0.0, 0.0, 0.0).into();
         }
@@ -1421,44 +992,6 @@ impl Camera {
     }
 }
 
-struct CameraState {
-    pos: cgmath::Vector3<f32>,
-    dir: cgmath::Quaternion<f32>,
-}
-impl CameraState {
-    fn new() -> Self {
-        Self {
-            pos: Vector3 {
-                x: 0.0,
-                y: 0.0,
-                z: 0.0,
-            },
-            dir: cgmath::Quaternion::one(),
-        }
-    }
-    fn update(&mut self, dt: f32, pressed_keys: &BTreeSet<KeyCode>) {
-        // 5-axis controls.
-
-        use winit::keyboard::KeyCode::{
-            KeyA, KeyD, KeyI, KeyJ, KeyK, KeyL, KeyS, KeyW, ShiftLeft, Space,
-        };
-
-        let key = |key: KeyCode| pressed_keys.contains(&key) as u8 as f32;
-
-        let delta = Vector3 {
-            x: key(KeyA) - key(KeyD),
-            y: key(Space) - key(ShiftLeft),
-            z: key(KeyW) - key(KeyS),
-        };
-
-        self.pos += delta * dt * 0.1;
-    }
-    fn transform(&self) -> cgmath::Matrix4<f32> {
-        // let basis = cgmath::Basis3::from_quaternion(&self.dir);
-        // let translation = cgmath::Basis3
-        cgmath::Matrix4::from_translation(self.pos)
-    }
-}
 struct Texture {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -1466,7 +999,6 @@ struct Texture {
 }
 impl Texture {
     const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-    //const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth16Unorm;
     fn new_depth(device: &wgpu::Device, surface_config: &wgpu::SurfaceConfiguration) -> Self {
         let size = wgpu::Extent3d {
             width: surface_config.width,
@@ -1557,14 +1089,6 @@ impl TimestampQuerySet {
             res
         })
     }
-    fn compute_timestamp_writes<'a>(&'a mut self) -> Option<wgpu::ComputePassTimestampWrites<'a>> {
-        self.push()
-            .map(|(start, end)| wgpu::ComputePassTimestampWrites {
-                query_set: &self.query_set,
-                beginning_of_pass_write_index: Some(start),
-                end_of_pass_write_index: Some(end),
-            })
-    }
     fn render_timestamp_writes<'a>(&'a mut self) -> Option<wgpu::RenderPassTimestampWrites<'a>> {
         self.push()
             .map(|(start, end)| wgpu::RenderPassTimestampWrites {
@@ -1616,7 +1140,7 @@ impl TimestampQuerySet {
             .get_mapped_range();
         let data: &[Query] = bytemuck::cast_slice(&tmp);
         for &Query { start, end } in data {
-            let elapsed = (end - start) as f64 * seconds_per_tick;
+            let elapsed = (end.wrapping_sub(start)) as f64 * seconds_per_tick;
             self.s0 += 1;
             self.s1 += elapsed;
             self.s2 += elapsed * elapsed;
@@ -1642,33 +1166,39 @@ impl TimestampQuerySet {
 }
 
 struct UpdateRenderPipeline {
+    label: String,
     path: String,
     filename: String,
     last_update: Duration,
     pipeline: wgpu::RenderPipeline,
-    vertex_buffer_layout: wgpu::VertexBufferLayout<'static>,
+    vertex_buffer_layout: Vec<wgpu::VertexBufferLayout<'static>>,
     surface_format: wgpu::TextureFormat,
     pipeline_layout: Rc<wgpu::PipelineLayout>,
     vs_main: &'static str,
-    fs_main: &'static str,
+    fs_main: Option<&'static str>,
     polygon_mode: wgpu::PolygonMode,
     timestamp: TimestampQuerySet,
+    write_depth: bool,
+    validation_error: Option<String>,
 }
 impl UpdateRenderPipeline {
     fn new(
+        label: &'static str,
         device: &wgpu::Device,
         pipeline_layout: Rc<wgpu::PipelineLayout>,
-        vertex_buffer_layout: wgpu::VertexBufferLayout<'static>,
+        vertex_buffer_layout: Vec<wgpu::VertexBufferLayout<'static>>,
         surface_format: wgpu::TextureFormat,
         (filename, source): (&'static str, &str),
-        vs_main: Option<&'static str>,
+        vs_main: &'static str,
         fs_main: Option<&'static str>,
         polygon_mode: wgpu::PolygonMode,
+        write_depth: bool,
     ) -> Self {
-        let vs_main = vs_main.unwrap_or("vs_main");
-        let fs_main = fs_main.unwrap_or("fs_main");
+        let vs_main = vs_main;
 
+        let label = format!("{filename} ({label})");
         let pipeline = Self::reconstruct(
+            &label,
             device,
             filename,
             source,
@@ -1678,11 +1208,13 @@ impl UpdateRenderPipeline {
             vs_main,
             fs_main,
             polygon_mode,
+            write_depth,
         );
 
         let timestamp = TimestampQuerySet::new(device);
 
         Self {
+            label,
             path: format!("src/{filename}.wgsl"),
             last_update: COMPILE_TIME,
             pipeline,
@@ -1694,6 +1226,8 @@ impl UpdateRenderPipeline {
             fs_main,
             polygon_mode,
             timestamp,
+            write_depth,
+            validation_error: None,
         }
     }
     fn get<'a>(
@@ -1705,7 +1239,7 @@ impl UpdateRenderPipeline {
     ) {
         #[cfg(not(debug_assertions))]
         {
-            return &self.pipeline;
+            return (self.timestamp.render_timestamp_writes(), &self.pipeline);
         }
         let time = std::fs::metadata(&self.path)
             .unwrap()
@@ -1719,6 +1253,7 @@ impl UpdateRenderPipeline {
             let source = std::fs::read_to_string(&self.path).unwrap();
             device.push_error_scope(wgpu::ErrorFilter::Validation);
             let pipeline = Self::reconstruct(
+                &self.label,
                 device,
                 &self.filename,
                 &source,
@@ -1728,26 +1263,49 @@ impl UpdateRenderPipeline {
                 self.vs_main,
                 self.fs_main,
                 self.polygon_mode,
+                self.write_depth,
             );
             if let Some(err) = device.pop_error_scope().block_on() {
-                println!("VALIDATION ERROR: {err}");
+                if let wgpu::Error::Validation {
+                    source,
+                    description,
+                } = err
+                {
+                    println!("VALIDATION ERROR: {}", &source);
+                    if let Some(wgpu_core::error::ContextError {
+                        string: _,
+                        cause,
+                        label_key: _,
+                        label: _,
+                    }) = source.downcast_ref::<wgpu_core::error::ContextError>()
+                    {
+                        self.validation_error = Some(cause.to_string());
+                    } else {
+                        self.validation_error = Some(description);
+                    }
+                } else {
+                    panic!("{err}");
+                }
             } else {
                 self.pipeline = pipeline;
+                self.validation_error = None;
             }
         }
 
         (self.timestamp.render_timestamp_writes(), &self.pipeline)
     }
     fn reconstruct(
+        label: &str,
         device: &wgpu::Device,
         filename: &str,
         source: &str,
         pipeline_layout: &wgpu::PipelineLayout,
-        vertex_buffer_layout: wgpu::VertexBufferLayout<'static>,
+        vertex_buffer_layout: Vec<wgpu::VertexBufferLayout<'static>>,
         surface_format: wgpu::TextureFormat,
         vs_main: &'static str,
-        fs_main: &'static str,
+        fs_main: Option<&'static str>,
         polygon_mode: wgpu::PolygonMode,
+        write_depth: bool,
     ) -> wgpu::RenderPipeline {
         let start = Instant::now();
         let shader_module = create_shader_module(
@@ -1758,25 +1316,30 @@ impl UpdateRenderPipeline {
             },
         );
 
+        let targets = [Some(wgpu::ColorTargetState {
+            format: surface_format,
+            blend: Some(wgpu::BlendState::REPLACE),
+            write_mask: wgpu::ColorWrites::ALL,
+        })];
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some(filename),
+            label: Some(label),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader_module,
                 entry_point: vs_main,
-                buffers: &[vertex_buffer_layout],
+                buffers: &vertex_buffer_layout,
                 compilation_options: default(),
             },
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
+                cull_mode: None, //Some(wgpu::Face::Back),
                 unclipped_depth: false,
                 polygon_mode,
                 conservative: false,
             },
-            depth_stencil: Some(wgpu::DepthStencilState {
+            depth_stencil: write_depth.then(|| wgpu::DepthStencilState {
                 format: Texture::DEPTH_FORMAT,
                 depth_write_enabled: true,
                 depth_compare: wgpu::CompareFunction::Less,
@@ -1788,14 +1351,10 @@ impl UpdateRenderPipeline {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            fragment: Some(wgpu::FragmentState {
+            fragment: fs_main.map(|fs_main| wgpu::FragmentState {
                 module: &shader_module,
                 entry_point: fs_main,
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                targets: &targets,
                 compilation_options: default(),
             }),
             multiview: None,
@@ -1903,8 +1462,10 @@ mod limits;
 
 #[derive(Default)]
 struct TimeStamps {
-    render: (f64, f64),
+    forward: (f64, f64),
     wireframe: (f64, f64),
+    depth: (f64, f64),
+    deferred: (f64, f64),
     sdf: (f64, f64),
     triangle_allocation: (f64, f64),
     prefix_top: (f64, f64),
@@ -1918,12 +1479,27 @@ struct GuiState {
     distance_culling: bool,
     cull_radius: f32,
     wireframe: bool,
-    filled: bool,
+    forward: bool,
     fog_radius: f32,
     fog: bool,
     show_render: bool,
+    deferred: bool,
+    depth_pre_pass: bool,
+    clear_render_times: bool,
+    compile_fail: Option<String>,
 
     timestamps: TimeStamps,
+
+    pos: Point3<u32>,
+
+    fog_color: [u8; 3],
+    diffuse_color: [u8; 3],
+    specular_color: [u8; 3],
+    light_color: [u8; 3],
+    sun_color: [u8; 3],
+}
+fn srgb(c: f32) -> u8 {
+    (c * 255.0) as u8
 }
 impl GuiState {
     fn new() -> Self {
@@ -1932,25 +1508,37 @@ impl GuiState {
             cull_radius: 6.0,
             distance_culling: true,
             wireframe: false,
-            filled: true,
+            forward: true,
+            deferred: false,
             fog_radius: 0.9,
             fog: true,
             timestamps: TimeStamps::default(),
             show_render: true,
+            clear_render_times: true,
+            depth_pre_pass: false,
+            compile_fail: None,
+            fog_color: [0.529, 0.808, 0.922].map(|c| c * 0.7).map(srgb),
+
+            light_color: [0.780, 0.141, 0.694].map(srgb),
+            diffuse_color: [0.5, 0.5, 0.5].map(srgb),
+
+            specular_color: [0.5, 0.5, 0.5].map(srgb),
+            sun_color: [0.98, 0.77, 0.40].map(srgb),
+            pos: (0, 0, 0).into(),
         }
     }
+
     fn run(&mut self, ui: &egui::Context) {
         egui::Window::new("Options")
             .default_open(true)
             .min_width(200.0)
-            //.max_width(1000.0)
-            //.max_height(800.0)
-            //.default_width(800.0)
             .resizable(true)
             .anchor(egui::Align2::LEFT_TOP, [0.0, 0.0])
             .show(&ui, |ui| {
-                ui.checkbox(&mut self.filled, "Regular geometry");
+                ui.checkbox(&mut self.forward, "Forward shading");
+                ui.checkbox(&mut self.deferred, "Deferred shading");
                 ui.checkbox(&mut self.wireframe, "Wireframe");
+                ui.checkbox(&mut self.depth_pre_pass, "Depth pre pass");
 
                 ui.separator();
 
@@ -1979,32 +1567,89 @@ impl GuiState {
                 ui.label(format!("FPS (vsync): {:.1}", self.timestamps.fps));
                 ui.label(format!(
                     "time per frame: {:?}",
-                    Duration::from_secs_f64(self.timestamps.render.0 + self.timestamps.wireframe.0)
+                    Duration::from_secs_f64(
+                        if self.forward {
+                            self.timestamps.forward.0
+                        } else {
+                            0.0
+                        } + if self.wireframe {
+                            self.timestamps.wireframe.0
+                        } else {
+                            0.0
+                        } + if self.deferred {
+                            self.timestamps.deferred.0
+                        } else {
+                            0.0
+                        } + if self.deferred || self.depth_pre_pass {
+                            self.timestamps.depth.0
+                        } else {
+                            0.0
+                        }
+                    )
                 ));
-                ui.checkbox(&mut self.show_render, "Show render times in graph");
-                egui_plot::Plot::new("")
-                    .legend(egui_plot::Legend::default())
-                    .show(ui, |plot_ui| {
-                        let mut v = Vec::new();
-                        if self.show_render {
-                            v.push((self.timestamps.render, "render"));
-                            v.push((self.timestamps.wireframe, "wireframe"));
-                        }
-                        v.extend([
-                            (self.timestamps.sdf, "sdf"),
-                            (self.timestamps.triangle_allocation, "triangle_allocation"),
-                            (self.timestamps.prefix_top, "prefix_top"),
-                            (self.timestamps.triangle_writeback, "triangle_writeback"),
-                            (self.timestamps.cull, "cull"),
-                        ]);
-                        for (i, ((mean, _), label)) in v.iter().enumerate() {
-                            let bar = egui_plot::BarChart::new(vec![egui_plot::Bar::new(
-                                i as f64, *mean,
-                            )])
-                            .name(label);
-                            plot_ui.bar_chart(bar);
-                        }
+                ui.label(format!(
+                    "pos: {}, {}, {}",
+                    self.pos.x, self.pos.y, self.pos.z
+                ));
+                ui.separator();
+
+                if let Some(err) = self.compile_fail.as_ref() {
+                    ui.label("COMPILE FAIL");
+                    let txt = egui::widget_text::RichText::new(err).monospace();
+                    ui.label(txt);
+                    ui.separator();
+                } else {
+                    egui::Grid::new("my_grid").num_columns(2).show(ui, |ui| {
+                        let mut color = |label, write| {
+                            ui.label(label);
+                            egui::widgets::color_picker::color_edit_button_srgb(ui, write);
+                            ui.end_row();
+                        };
+                        color("specular", &mut self.specular_color);
+                        color("fog", &mut self.fog_color);
+                        color("light", &mut self.light_color);
+                        color("sun", &mut self.sun_color);
+                        color("diffuse", &mut self.diffuse_color);
                     });
+
+                    ui.checkbox(&mut self.show_render, "Show render times in graph");
+                    ui.checkbox(
+                        &mut self.clear_render_times,
+                        "Clear render times on each update",
+                    );
+                    egui_plot::Plot::new("")
+                        .legend(egui_plot::Legend::default())
+                        .allow_drag(false)
+                        .allow_zoom(false)
+                        .allow_scroll(false)
+                        .allow_boxed_zoom(false)
+                        .allow_double_click_reset(false)
+                        .y_axis_label("time [ms]")
+                        .show(ui, |plot_ui| {
+                            let mut v = Vec::new();
+                            if self.show_render {
+                                v.push((self.timestamps.forward, "render"));
+                                v.push((self.timestamps.wireframe, "wireframe"));
+                                v.push((self.timestamps.depth, "depth"));
+                                v.push((self.timestamps.deferred, "deferred"));
+                            }
+                            v.extend([
+                                (self.timestamps.sdf, "sdf"),
+                                (self.timestamps.triangle_allocation, "triangle_allocation"),
+                                (self.timestamps.prefix_top, "prefix_top"),
+                                (self.timestamps.triangle_writeback, "triangle_writeback"),
+                                (self.timestamps.cull, "cull"),
+                            ]);
+                            for (i, ((mean, _), label)) in v.iter().enumerate() {
+                                let bar = egui_plot::BarChart::new(vec![egui_plot::Bar::new(
+                                    i as f64,
+                                    (*mean) * 1000.0,
+                                )])
+                                .name(label);
+                                plot_ui.bar_chart(bar);
+                            }
+                        });
+                }
             });
     }
     fn cull_radius(&self) -> f32 {
@@ -2035,7 +1680,6 @@ struct State<'a> {
     camera: Camera,
 
     bitpack_bind_group: wgpu::BindGroup,
-    // triangle_storage: wgpu::Buffer,
     t0: Instant,
     camera_buffer: MetaBuffer,
     last_time: Instant,
@@ -2044,6 +1688,11 @@ struct State<'a> {
 
     egui: EguiRenderer,
     gui: GuiState,
+
+    deferred_bind_group_depth: wgpu::BindGroup,
+    deferred_bind_group_camera: wgpu::BindGroup,
+    deferred_render_pipeline: UpdateRenderPipeline,
+    depth_render_pipeline: UpdateRenderPipeline,
 }
 impl<'a> State<'a> {
     fn new(window: &'a winit::window::Window, cube_march: &CubeMarch) -> Self {
@@ -2069,12 +1718,12 @@ impl<'a> State<'a> {
             .unwrap();
         let adapter_limits = adapter.limits();
         let surface_caps = dbg!(surface.get_capabilities(&adapter));
-        let surface_format = surface
+        let surface_format = dbg!(surface
             .get_capabilities(&adapter)
             .formats
             .into_iter()
             .find(|format| format.is_srgb())
-            .unwrap();
+            .unwrap());
         // egui_wgpu::preferred_framebuffer_format(&surface.get_capabilities(&adapter).formats)
         //     .unwrap();
 
@@ -2124,10 +1773,10 @@ impl<'a> State<'a> {
 
         let camera = Camera::new(&surface_config);
 
-        let gui_state = GuiState::new();
+        let gui = GuiState::new();
 
         let camera_buffer =
-            MetaBuffer::new_uniform(&device, UNIFORM | COPY_DST, &camera.uniform(&gui_state));
+            MetaBuffer::new_uniform(&device, UNIFORM | COPY_DST, &camera.uniform(&gui));
 
         let depth_texture = Texture::new_depth(&device, &surface_config);
 
@@ -2136,16 +1785,11 @@ impl<'a> State<'a> {
         let bitpack_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("bitpack_layout"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
+                camera_buffer.binding_layout(
+                    VERTEX_STAGE | FRAGMENT_STAGE,
+                    wgpu::BufferBindingType::Uniform,
+                    0,
+                ),
                 storage.trigen.render_case_uniform.binding_layout(
                     VERTEX_STAGE,
                     wgpu::BufferBindingType::Storage { read_only: true },
@@ -2178,25 +1822,89 @@ impl<'a> State<'a> {
         };
 
         let bitpack_render_pipeline = UpdateRenderPipeline::new(
+            "forward shading",
             &device,
             bitpack_pipeline_layout.clone(),
-            bitpack_vertex_buffer_layout.clone(),
+            vec![bitpack_vertex_buffer_layout.clone()],
             surface_config.format,
             source!("chunk_draw"),
-            None,
+            "vs_main",
+            Some("fs_main"),
+            wgpu::PolygonMode::Fill,
+            true,
+        );
+
+        let deferred_bind_group_camera_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("deferred bind group camera layout"),
+                entries: &[camera_buffer.binding_layout(
+                    VERTEX_STAGE | FRAGMENT_STAGE,
+                    wgpu::BufferBindingType::Uniform,
+                    0,
+                )],
+            });
+
+        let deferred_bind_group_camera = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("deferred bind group camera"),
+            layout: &deferred_bind_group_camera_layout,
+            entries: &[camera_buffer.binding(0)],
+        });
+
+        let deferred_bind_group_depth_layout = create_deferred_bind_group_depth_layout(&device);
+
+        let deferred_bind_group_depth = create_deferred_bind_group_depth(
+            &device,
+            &deferred_bind_group_depth_layout,
+            &depth_texture,
+        );
+
+        let deferred_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("deferred pipeline layout"),
+                bind_group_layouts: &[
+                    &deferred_bind_group_camera_layout,
+                    &deferred_bind_group_depth_layout,
+                ],
+                push_constant_ranges: &[],
+            });
+
+        let deferred_render_pipeline = UpdateRenderPipeline::new(
+            "deferred shading",
+            &device,
+            Rc::new(deferred_pipeline_layout),
+            vec![],
+            surface_config.format,
+            source!("chunk_draw"),
+            "vs_deferred",
+            Some("fs_deferred"),
+            wgpu::PolygonMode::Fill,
+            false,
+        );
+
+        let depth_render_pipeline = UpdateRenderPipeline::new(
+            "depth pass",
+            &device,
+            bitpack_pipeline_layout.clone(),
+            vec![bitpack_vertex_buffer_layout.clone()],
+            surface_config.format,
+            source!("chunk_draw"),
+            "vs_main",
             None,
             wgpu::PolygonMode::Fill,
+            true,
         );
 
         let wireframe_render_pipeline = UpdateRenderPipeline::new(
+            "wireframe",
             &device,
             bitpack_pipeline_layout,
-            bitpack_vertex_buffer_layout,
+            vec![bitpack_vertex_buffer_layout],
             surface_config.format,
             source!("chunk_draw"),
-            None,
+            "vs_main",
             Some("fs_wire"),
             wgpu::PolygonMode::Line,
+            true,
         );
 
         let last_time = Instant::now();
@@ -2222,7 +1930,11 @@ impl<'a> State<'a> {
             storage,
             wireframe_render_pipeline,
             egui,
-            gui: gui_state,
+            gui,
+            deferred_bind_group_depth,
+            deferred_bind_group_camera,
+            deferred_render_pipeline,
+            depth_render_pipeline,
         }
     }
     fn draw(
@@ -2233,46 +1945,36 @@ impl<'a> State<'a> {
     ) {
         let dt = replace(&mut self.t0, Instant::now())
             .elapsed()
-            .as_secs_f32();
+            .as_secs_f64();
         let output = self.surface.get_current_texture().unwrap();
         let view = &output.texture.create_view(&default());
         let mut encoder = self.device.create_command_encoder(&default());
-        self.storage
-            .dispatch(&self.device, &self.queue, self.camera.pos);
-        let mut first = true;
+        let pos = pos_to_target(self.camera.pos);
+        self.gui.pos = pos;
+        self.storage.dispatch(&self.device, &self.queue, pos);
+        let mut first_color = true;
+        let mut first_depth = true;
 
         if self.gui.culling {
             self.storage.cull(&mut encoder);
         }
 
-        //let clear_color = wgpu::Color { r: 0.1, g: 0.2, b: 0.3, a: 1.0, };
         let clear_color = wgpu::Color {
-            r: 0.2,
-            g: 0.1,
-            b: 0.2,
+            r: (self.gui.fog_color[0] as f64) / 255.0,
+            g: (self.gui.fog_color[1] as f64) / 255.0,
+            b: (self.gui.fog_color[2] as f64) / 255.0,
             a: 1.0,
         };
 
-        if self.gui.filled {
-            let (timestamp_writes, pipeline) = self.bitpack_render_pipeline.get(&self.device);
+        if self.gui.depth_pre_pass || self.gui.deferred {
+            let (timestamp_writes, pipeline) = self.depth_render_pipeline.get(&self.device);
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: if first {
-                            wgpu::LoadOp::Clear(clear_color)
-                        } else {
-                            wgpu::LoadOp::Load
-                        },
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
+                color_attachments: &[],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth_texture.view,
                     depth_ops: Some(wgpu::Operations {
-                        load: if first {
+                        load: if first_depth {
                             wgpu::LoadOp::Clear(1.0)
                         } else {
                             wgpu::LoadOp::Load
@@ -2287,7 +1989,70 @@ impl<'a> State<'a> {
             render_pass.set_pipeline(pipeline);
             render_pass.set_bind_group(0, &self.bitpack_bind_group, &[]);
             self.storage.draw(&mut render_pass, self.gui.culling);
-            first = false;
+            first_depth = false;
+        }
+
+        if self.gui.deferred {
+            let (timestamp_writes, pipeline) = self.deferred_render_pipeline.get(&self.device);
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(clear_color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes,
+                occlusion_query_set: None,
+            });
+            render_pass.set_bind_group(0, &self.deferred_bind_group_camera, &[]);
+            render_pass.set_bind_group(1, &self.deferred_bind_group_depth, &[]);
+            render_pass.set_pipeline(pipeline);
+            render_pass.draw(0..6, 0..1);
+
+            first_color = false;
+            first_depth = false;
+        }
+
+        if self.gui.forward {
+            let (timestamp_writes, pipeline) = self.bitpack_render_pipeline.get(&self.device);
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: if first_color {
+                            wgpu::LoadOp::Clear(clear_color)
+                        } else {
+                            wgpu::LoadOp::Load
+                        },
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_texture.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: if first_depth {
+                            wgpu::LoadOp::Clear(1.0)
+                        } else {
+                            wgpu::LoadOp::Load
+                        },
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes,
+                occlusion_query_set: None,
+            });
+            render_pass.set_pipeline(pipeline);
+            render_pass.set_bind_group(0, &self.bitpack_bind_group, &[]);
+            self.storage.draw(&mut render_pass, self.gui.culling);
+            first_color = false;
+            first_depth = false;
         }
 
         if self.gui.wireframe {
@@ -2298,7 +2063,7 @@ impl<'a> State<'a> {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: if first {
+                        load: if first_color {
                             wgpu::LoadOp::Clear(clear_color)
                         } else {
                             wgpu::LoadOp::Load
@@ -2309,7 +2074,7 @@ impl<'a> State<'a> {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth_texture.view,
                     depth_ops: Some(wgpu::Operations {
-                        load: if first {
+                        load: if first_depth {
                             wgpu::LoadOp::Clear(1.0)
                         } else {
                             wgpu::LoadOp::Load
@@ -2324,7 +2089,8 @@ impl<'a> State<'a> {
             render_pass.set_pipeline(pipeline);
             render_pass.set_bind_group(0, &self.bitpack_bind_group, &[]);
             self.storage.draw(&mut render_pass, self.gui.culling);
-            first = false;
+            first_color = false;
+            first_depth = false;
         }
 
         {
@@ -2346,14 +2112,6 @@ impl<'a> State<'a> {
 
         self.camera
             .update(&self.surface_config, dt, held_keys, pressed_keys);
-        //let t = self.t0.elapsed().as_secs_f32();
-        // self.camera.eye = (
-        //     2.0 * t.sin(),
-        //     (t * 2.0_f32.sqrt() * 0.5).sin() * 0.1,
-        //     2.0 * t.cos(),
-        // )
-        //     .into();
-        // self.camera.eye *= 32.0;
         self.camera_buffer
             .write(&self.queue, self.camera.uniform(&self.gui));
         let elapsed = self.last_time.elapsed().as_secs_f64();
@@ -2366,24 +2124,43 @@ impl<'a> State<'a> {
                 self.storage.offset as f64 / 1_000_000.0,
                 self.storage.data.len(),
             );
-            if let Some(ref q) = self.storage.query {
-                q.stats.display();
-            }
 
             self.last_count = 0;
             self.last_time = Instant::now();
 
+            let fail_ref = [
+                &self.deferred_render_pipeline,
+                &self.bitpack_render_pipeline,
+                &self.wireframe_render_pipeline,
+            ]
+            .iter()
+            .find_map(|p| p.validation_error.as_ref());
+            if fail_ref.is_some() ^ self.gui.compile_fail.is_some() {
+                self.gui.compile_fail = fail_ref.map(String::clone);
+            }
             {
-                self.bitpack_render_pipeline.timestamp.reset();
-                self.wireframe_render_pipeline.timestamp.reset();
+                if self.gui.clear_render_times {
+                    self.bitpack_render_pipeline.timestamp.reset();
+                    self.wireframe_render_pipeline.timestamp.reset();
+                    self.depth_render_pipeline.timestamp.reset();
+                    self.deferred_render_pipeline.timestamp.reset();
+                }
 
                 let mut gui_timestamps = TimeStamps::default();
                 gui_timestamps.fps = fps;
 
                 let mut timestamps = [
                     (
+                        &mut self.depth_render_pipeline.timestamp,
+                        &mut gui_timestamps.depth,
+                    ),
+                    (
+                        &mut self.deferred_render_pipeline.timestamp,
+                        &mut gui_timestamps.deferred,
+                    ),
+                    (
                         &mut self.bitpack_render_pipeline.timestamp,
-                        &mut gui_timestamps.render,
+                        &mut gui_timestamps.forward,
                     ),
                     (
                         &mut self.wireframe_render_pipeline.timestamp,
@@ -2442,15 +2219,52 @@ impl<'a> State<'a> {
             self.surface_config.height = size.height;
             self.surface.configure(&self.device, &self.surface_config);
             self.depth_texture = Texture::new_depth(&self.device, &self.surface_config);
+            let deferred_bind_group_depth_layout =
+                create_deferred_bind_group_depth_layout(&self.device);
+            self.deferred_bind_group_depth = create_deferred_bind_group_depth(
+                &self.device,
+                &deferred_bind_group_depth_layout,
+                &self.depth_texture,
+            );
         }
     }
+}
+
+fn create_deferred_bind_group_depth(
+    device: &wgpu::Device,
+    deferred_bind_group_depth_layout: &wgpu::BindGroupLayout,
+    depth_texture: &Texture,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("deferred bind group depth"),
+        layout: deferred_bind_group_depth_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(&depth_texture.view),
+        }],
+    })
+}
+
+fn create_deferred_bind_group_depth_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("deferred bind group depth layout"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Depth,
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        }],
+    })
 }
 
 fn main() {
     std::env::set_var("RUST_BACKTRACE", "1");
     let cube_march = CubeMarch::new();
     env_logger::init();
-    //cube_march_cpu();
     println!("Do not forget `nix-shell`");
     let event_loop = EventLoop::new()
         .map_err(|e| (e, "you probably forgot nix-shell"))
@@ -2474,6 +2288,7 @@ fn main() {
             Event::WindowEvent { window_id, event } => {
                 if window_id == window.id() {
                     let egui_winit::EventResponse { consumed, .. }= state.egui.input(window, &event);
+                    if consumed { return }
                     match event {
                         WindowEvent::CloseRequested | WindowEvent::KeyboardInput {
                             event: KeyEvent { logical_key: winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape), .. }, ..

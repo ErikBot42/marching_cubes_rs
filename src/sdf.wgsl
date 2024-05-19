@@ -21,13 +21,14 @@ fn sdf(x0: i32, y0: i32, z0: i32) -> f32 {
     // let y = (f32(y0) / 2.0);// % 30.0 - 8.0;
     // let z = (f32(z0) / 2.0);// % 30.0 - 8.0;
 
-    let sc = 32.0 * 2.0;
+    let sc = 32.0 * 2;
+    let ss = 4 * 32;
 
     var pi = vec3<i32>(x0, y0, z0);
 
 
-    let layer = pi.y / (4 * 32);
-    pi %= 4 * 32;
+    let layer = pi.y / ss;
+    pi %= ss;
 
 
     var p = (vec3<f32>(pi) - sc) / (sc * 2.0);

@@ -985,6 +985,7 @@ dependencies = [
  "log",
  "pollster",
  "wgpu",
+ "wgpu-core",
  "winit",
 ]
 

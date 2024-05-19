@@ -8,16 +8,31 @@ struct DrawCall {
 
 
 struct CameraUniform {
-    view: mat4x4<f32>, // world, view
-    view_proj: mat4x4<f32>, // world, clip
-    lmap: mat4x4<f32>, // world, light
-    lmap_inv: mat4x4<f32>, // light, world
+    world_view: mat4x4<f32>,  // AKA view
+    view_world: mat4x4<f32>,  // AKA view_inv
+
+    world_clipw: mat4x4<f32>, // AKA view_proj
+    clipw_world: mat4x4<f32>, // AKA view_proj_inv
+    clipw_view: mat4x4<f32>,
+
+    world_light: mat4x4<f32>,
+    light_world: mat4x4<f32>,
+
     time: f32,
-    radius: f32,
-    _unused1: f32,
+    cull_radius: f32,
+    fog_inv: f32,
     _unused2: f32,
-    cull: mat4x4<f32>,
-};
+
+    world_clipw_cull: mat4x4<f32>,
+
+    fog_color: vec3<f32>,
+    diffuse_color: vec3<f32>,
+    specular_color: vec3<f32>,
+    light_color: vec3<f32>,
+    sun_color: vec3<f32>,
+
+    base_offset: vec3<i32>,
+}
 
 @group(0) @binding(0)
 var<uniform> camera: CameraUniform;
@@ -37,9 +52,12 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let src: DrawCall = src_buffer[i];
 
     let pos_mask = src.first_vertex / 3u;
-    let pos_offset = vec4<f32>(vec3<f32>(vec3<u32>(pos_mask & 1023u, (pos_mask >> 10u) & 1023u, (pos_mask >> 20u) & 1023u)) * 2.0 + 1.0, 1.0);
+    let pos_offset = vec4<f32>(vec3<f32>(
+        vec3<i32>(vec3<u32>(pos_mask & 1023u, (pos_mask >> 10u) & 1023u, (pos_mask >> 20u) & 1023u))
+        - camera.base_offset
+    ) * 2.0 + 1.0, 1.0);
 
-    let pos = camera.cull * pos_offset;
+    let pos = camera.world_clipw_cull * pos_offset;
 
     var visible = true;
 
@@ -54,8 +72,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     visible = visible && pos.z > 0.0;
     if visible {
         // distance cull
-        let rad = camera.radius;
-        let pos_view = camera.view * pos_offset;
+        let rad = camera.cull_radius;
+        let pos_view = camera.world_view * pos_offset;
         visible = visible && pos_view.z > -rad;
         visible = visible && dot(pos_view.xyz, pos_view.xyz) < (rad * pos_view.w) * (rad * pos_view.w);
     }

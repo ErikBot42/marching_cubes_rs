@@ -44,6 +44,10 @@ version = "0.20.0"
 features = ["wgsl"]
 default-features = false
 
+[dependencies.wgpu-core]
+version = "0.20.0"
+default-features = false
+
 [dependencies.pollster]
 version = "0.3.0"
 default-features = false
