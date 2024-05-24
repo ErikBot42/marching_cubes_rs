@@ -778,8 +778,8 @@ macro_rules! uniform_magic {
 
 uniform_magic!(
     struct CameraUniform {
-        world_view: mat4x4<f32>,  // AKA view
-        view_world: mat4x4<f32>,  // AKA view_inv
+        world_view: mat4x4<f32>, // AKA view
+        view_world: mat4x4<f32>, // AKA view_inv
 
         world_clipw: mat4x4<f32>, // AKA view_proj
         clipw_world: mat4x4<f32>, // AKA view_proj_inv
@@ -791,7 +791,7 @@ uniform_magic!(
         time: f32,
         cull_radius: f32,
         fog_inv: f32,
-        _unused2: f32,
+        ssao_radius: f32,
 
         world_clipw_cull: mat4x4<f32>,
 
@@ -802,6 +802,7 @@ uniform_magic!(
         sun_color: vec3<f32>,
 
         base_offset: vec3<i32>,
+        view_clipw: mat4x4<f32>,
     }
 );
 
@@ -884,14 +885,14 @@ impl Camera {
         CameraUniform {
             world_view: conv_mat(view),
             view_world: conv_mat(view.invert().unwrap()),
-            world_clipw: dbg!(conv_mat(view_projection)),
+            world_clipw: conv_mat(view_projection),
             clipw_world: conv_mat(view_projection.invert().unwrap()),
             world_light: lmap.into(),
             light_world: lmap_inv.into(),
             time: self.time as f32,
             cull_radius: gui.cull_radius(),
             fog_inv: 1.0 / gui.fog().powi(2),
-            _unused2: 0.0,
+            ssao_radius: gui.ssao_radius,
             world_clipw_cull: conv_mat(cull),
             fog_color: expand(gui.fog_color),
             diffuse_color: expand(gui.diffuse_color),
@@ -900,6 +901,7 @@ impl Camera {
             sun_color: expand(gui.sun_color),
             clipw_view: conv_mat(proj.invert().unwrap()),
             base_offset: expand_v(self.base_offset()),
+            view_clipw: conv_mat(proj),
         }
     }
     fn proj(&self) -> Matrix4<f64> {
@@ -920,7 +922,7 @@ impl Camera {
             aspect: surface_config.width as f64 / surface_config.height as f64,
             fovy: 45.0,
             znear: 0.01,
-            zfar: 100.0,
+            zfar: 10.0,
             dir: Quaternion::look_at(
                 Vector3 {
                     x: -1.0,
@@ -995,7 +997,6 @@ impl Camera {
 struct Texture {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
-    sampler: wgpu::Sampler,
 }
 impl Texture {
     const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -1018,24 +1019,7 @@ impl Texture {
 
         let view = texture.create_view(&default());
 
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: None,
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            lod_min_clamp: 0.0,
-            lod_max_clamp: 100.0,
-            ..default()
-        });
-
-        Self {
-            texture,
-            view,
-            sampler,
-        }
+        Self { texture, view }
     }
 }
 
@@ -1241,16 +1225,25 @@ impl UpdateRenderPipeline {
         {
             return (self.timestamp.render_timestamp_writes(), &self.pipeline);
         }
-        let time = std::fs::metadata(&self.path)
-            .unwrap()
-            .modified()
-            .unwrap()
-            .duration_since(UNIX_EPOCH)
-            .unwrap();
+        fn get_time(path: &str) -> Option<Duration> {
+            std::fs::metadata(path)
+                .ok()?
+                .modified()
+                .ok()?
+                .duration_since(UNIX_EPOCH)
+                .ok()
+        }
+
+        let Some(time) = get_time(&self.path) else {
+            return (self.timestamp.render_timestamp_writes(), &self.pipeline);
+        };
 
         if time > self.last_update {
+            let Ok(source) = std::fs::read_to_string(&self.path) else {
+                return (self.timestamp.render_timestamp_writes(), &self.pipeline);
+            };
+
             self.last_update = time;
-            let source = std::fs::read_to_string(&self.path).unwrap();
             device.push_error_scope(wgpu::ErrorFilter::Validation);
             let pipeline = Self::reconstruct(
                 &self.label,
@@ -1381,7 +1374,10 @@ mod egui_render {
             let ctx = egui::Context::default();
             let id = ctx.viewport_id();
 
-            let visuals = egui::Visuals::default();
+            let visuals = egui::Visuals {
+                window_shadow: egui::Shadow::NONE,
+                ..Default::default()
+            };
 
             ctx.set_visuals(visuals);
 
@@ -1488,6 +1484,8 @@ struct GuiState {
     clear_render_times: bool,
     compile_fail: Option<String>,
 
+    ssao_radius: f32,
+
     timestamps: TimeStamps,
 
     pos: Point3<u32>,
@@ -1525,6 +1523,7 @@ impl GuiState {
             specular_color: [0.5, 0.5, 0.5].map(srgb),
             sun_color: [0.98, 0.77, 0.40].map(srgb),
             pos: (0, 0, 0).into(),
+            ssao_radius: 55.0,
         }
     }
 
@@ -1537,6 +1536,11 @@ impl GuiState {
             .show(&ui, |ui| {
                 ui.checkbox(&mut self.forward, "Forward shading");
                 ui.checkbox(&mut self.deferred, "Deferred shading");
+                if self.deferred {
+                    ui.add(
+                        egui::Slider::new(&mut self.ssao_radius, 20.0..=200.0).text("ssao radius"),
+                    );
+                }
                 ui.checkbox(&mut self.wireframe, "Wireframe");
                 ui.checkbox(&mut self.depth_pre_pass, "Depth pre pass");
 
@@ -1668,6 +1672,37 @@ impl GuiState {
     }
 }
 
+struct SurfaceDep {
+    deferred_bind_group_depth: wgpu::BindGroup,
+    depth_texture: Texture,
+}
+impl SurfaceDep {
+    fn new(
+        size: winit::dpi::PhysicalSize<u32>,
+        device: &wgpu::Device,
+        surface_config: &mut wgpu::SurfaceConfiguration,
+        surface: &wgpu::Surface,
+        deferred_bind_group_depth_layout: &wgpu::BindGroupLayout,
+    ) -> Self {
+        surface_config.width = size.width;
+        surface_config.height = size.height;
+        surface.configure(&device, &surface_config);
+        let depth_texture = Texture::new_depth(&device, &surface_config);
+        let deferred_bind_group_depth = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("deferred bind group depth"),
+            layout: deferred_bind_group_depth_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&depth_texture.view),
+            }],
+        });
+        Self {
+            deferred_bind_group_depth,
+            depth_texture,
+        }
+    }
+}
+
 struct State<'a> {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -1676,7 +1711,7 @@ struct State<'a> {
     surface_config: wgpu::SurfaceConfiguration,
     bitpack_render_pipeline: UpdateRenderPipeline,
     wireframe_render_pipeline: UpdateRenderPipeline,
-    depth_texture: Texture,
+    background_render_pipeline: UpdateRenderPipeline,
     camera: Camera,
 
     bitpack_bind_group: wgpu::BindGroup,
@@ -1689,10 +1724,13 @@ struct State<'a> {
     egui: EguiRenderer,
     gui: GuiState,
 
-    deferred_bind_group_depth: wgpu::BindGroup,
     deferred_bind_group_camera: wgpu::BindGroup,
     deferred_render_pipeline: UpdateRenderPipeline,
     depth_render_pipeline: UpdateRenderPipeline,
+
+    dd: SurfaceDep,
+
+    deferred_bind_group_depth_layout: wgpu::BindGroupLayout,
 }
 impl<'a> State<'a> {
     fn new(window: &'a winit::window::Window, cube_march: &CubeMarch) -> Self {
@@ -1759,17 +1797,20 @@ impl<'a> State<'a> {
             Err(e) => panic!("{}", e),
         };
 
-        let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
+        let size = winit::dpi::PhysicalSize {
             width: 200,
             height: 200,
+        };
+        let mut surface_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: surface_format,
+            width: size.width,
+            height: size.height,
             present_mode: wgpu::PresentMode::AutoVsync, // wgpu::PresentMode::AutoNoVsync,
             desired_maximum_frame_latency: 2,
             alpha_mode: dbg!(&surface_caps.alpha_modes)[0],
             view_formats: vec![],
         };
-        surface.configure(&device, &surface_config);
 
         let camera = Camera::new(&surface_config);
 
@@ -1850,13 +1891,20 @@ impl<'a> State<'a> {
             entries: &[camera_buffer.binding(0)],
         });
 
-        let deferred_bind_group_depth_layout = create_deferred_bind_group_depth_layout(&device);
-
-        let deferred_bind_group_depth = create_deferred_bind_group_depth(
-            &device,
-            &deferred_bind_group_depth_layout,
-            &depth_texture,
-        );
+        let deferred_bind_group_depth_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("deferred bind group depth layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                }],
+            });
 
         let deferred_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1867,6 +1915,26 @@ impl<'a> State<'a> {
                 ],
                 push_constant_ranges: &[],
             });
+
+        let background_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("background pipeline layout"),
+                bind_group_layouts: &[&deferred_bind_group_camera_layout],
+                push_constant_ranges: &[],
+            });
+
+        let background_render_pipeline = UpdateRenderPipeline::new(
+            "background shading",
+            &device,
+            Rc::new(background_pipeline_layout),
+            vec![],
+            surface_config.format,
+            source!("chunk_draw"),
+            "vs_deferred",
+            Some("fs_background"),
+            wgpu::PolygonMode::Fill,
+            true,
+        );
 
         let deferred_render_pipeline = UpdateRenderPipeline::new(
             "deferred shading",
@@ -1913,12 +1981,19 @@ impl<'a> State<'a> {
 
         let egui = EguiRenderer::new(&device, surface_format, window);
 
+        let dd = SurfaceDep::new(
+            size,
+            &device,
+            &mut surface_config,
+            &surface,
+            &deferred_bind_group_depth_layout,
+        );
+
         Self {
             device,
             queue,
             instance,
             surface,
-            depth_texture,
             camera,
             surface_config,
             t0,
@@ -1931,10 +2006,12 @@ impl<'a> State<'a> {
             wireframe_render_pipeline,
             egui,
             gui,
-            deferred_bind_group_depth,
             deferred_bind_group_camera,
             deferred_render_pipeline,
             depth_render_pipeline,
+            background_render_pipeline,
+            dd,
+            deferred_bind_group_depth_layout,
         }
     }
     fn draw(
@@ -1972,7 +2049,7 @@ impl<'a> State<'a> {
                 label: None,
                 color_attachments: &[],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_texture.view,
+                    view: &self.dd.depth_texture.view,
                     depth_ops: Some(wgpu::Operations {
                         load: if first_depth {
                             wgpu::LoadOp::Clear(1.0)
@@ -2009,16 +2086,16 @@ impl<'a> State<'a> {
                 occlusion_query_set: None,
             });
             render_pass.set_bind_group(0, &self.deferred_bind_group_camera, &[]);
-            render_pass.set_bind_group(1, &self.deferred_bind_group_depth, &[]);
+            render_pass.set_bind_group(1, &self.dd.deferred_bind_group_depth, &[]);
             render_pass.set_pipeline(pipeline);
             render_pass.draw(0..6, 0..1);
-
             first_color = false;
             first_depth = false;
         }
 
         if self.gui.forward {
-            let (timestamp_writes, pipeline) = self.bitpack_render_pipeline.get(&self.device);
+            let (timestamp_writes, bitpack_pipeline) =
+                self.bitpack_render_pipeline.get(&self.device);
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2034,7 +2111,7 @@ impl<'a> State<'a> {
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_texture.view,
+                    view: &self.dd.depth_texture.view,
                     depth_ops: Some(wgpu::Operations {
                         load: if first_depth {
                             wgpu::LoadOp::Clear(1.0)
@@ -2048,9 +2125,17 @@ impl<'a> State<'a> {
                 timestamp_writes,
                 occlusion_query_set: None,
             });
-            render_pass.set_pipeline(pipeline);
+            render_pass.set_pipeline(bitpack_pipeline);
             render_pass.set_bind_group(0, &self.bitpack_bind_group, &[]);
             self.storage.draw(&mut render_pass, self.gui.culling);
+
+            let (_timestamp_writes, background_pipeline) =
+                self.background_render_pipeline.get(&self.device);
+
+            render_pass.set_pipeline(background_pipeline);
+            render_pass.set_bind_group(0, &self.deferred_bind_group_camera, &[]);
+            render_pass.draw(0..6, 0..1);
+
             first_color = false;
             first_depth = false;
         }
@@ -2072,7 +2157,7 @@ impl<'a> State<'a> {
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_texture.view,
+                    view: &self.dd.depth_texture.view,
                     depth_ops: Some(wgpu::Operations {
                         load: if first_depth {
                             wgpu::LoadOp::Clear(1.0)
@@ -2135,9 +2220,7 @@ impl<'a> State<'a> {
             ]
             .iter()
             .find_map(|p| p.validation_error.as_ref());
-            if fail_ref.is_some() ^ self.gui.compile_fail.is_some() {
-                self.gui.compile_fail = fail_ref.map(String::clone);
-            }
+            self.gui.compile_fail = fail_ref.map(Clone::clone);
             {
                 if self.gui.clear_render_times {
                     self.bitpack_render_pipeline.timestamp.reset();
@@ -2215,34 +2298,15 @@ impl<'a> State<'a> {
     }
     fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
         if size.width > 0 && size.height > 0 {
-            self.surface_config.width = size.width;
-            self.surface_config.height = size.height;
-            self.surface.configure(&self.device, &self.surface_config);
-            self.depth_texture = Texture::new_depth(&self.device, &self.surface_config);
-            let deferred_bind_group_depth_layout =
-                create_deferred_bind_group_depth_layout(&self.device);
-            self.deferred_bind_group_depth = create_deferred_bind_group_depth(
+            self.dd = SurfaceDep::new(
+                size,
                 &self.device,
-                &deferred_bind_group_depth_layout,
-                &self.depth_texture,
+                &mut self.surface_config,
+                &self.surface,
+                &self.deferred_bind_group_depth_layout,
             );
         }
     }
-}
-
-fn create_deferred_bind_group_depth(
-    device: &wgpu::Device,
-    deferred_bind_group_depth_layout: &wgpu::BindGroupLayout,
-    depth_texture: &Texture,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("deferred bind group depth"),
-        layout: deferred_bind_group_depth_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: wgpu::BindingResource::TextureView(&depth_texture.view),
-        }],
-    })
 }
 
 fn create_deferred_bind_group_depth_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
